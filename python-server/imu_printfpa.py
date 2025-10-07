@@ -13,8 +13,10 @@ Examples:
   python imu_printfpa.py --file sample.csv --gyro-units rad
   python imu_printfpa.py --file sample.csv --no-orientation
 """
-import sys, math, time, threading, queue, argparse
+import sys, math, time, threading, queue, argparse, re
 from collections import deque
+
+import numpy as np
 
 # -------- optional deps ----------
 try:
@@ -31,6 +33,48 @@ except Exception:
 # -------- GUI deps (required) ----
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore
+
+try:
+    import pyqtgraph.opengl as gl
+    HAVE_GL = True
+except Exception:
+    gl = None
+    HAVE_GL = False
+
+
+class FootOrientationState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.roll = math.nan
+        self.pitch = math.nan
+        self.yaw = math.nan
+
+    def update(self, roll_deg, pitch_deg, yaw_deg):
+        with self.lock:
+            self.roll = roll_deg
+            self.pitch = pitch_deg
+            self.yaw = yaw_deg
+
+    def snapshot(self):
+        with self.lock:
+            return self.roll, self.pitch, self.yaw
+
+
+FOOT_ORIENTATION = FootOrientationState()
+FOOT_DEBUG_RE = re.compile(r"footDeg\(r/p/y\)=([\-\d\.]+|nan)/([\-\d\.]+|nan)/([\-\d\.]+|nan)")
+
+
+def update_foot_orientation_from_debug(line: str):
+    m = FOOT_DEBUG_RE.search(line)
+    if not m:
+        return
+    vals = []
+    for token in m.groups():
+        try:
+            vals.append(float(token))
+        except ValueError:
+            vals.append(float("nan"))
+    FOOT_ORIENTATION.update(vals[0], vals[1], vals[2])
 
 
 def parse_args():
@@ -65,6 +109,7 @@ def parse_line(line):
         return None
     if s.startswith("# FPA dbg"):
         print(s)
+        update_foot_orientation_from_debug(s)
         return None
     if s.startswith("#"):
         return None
@@ -200,6 +245,9 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.fpa_dx = math.nan
         self.fpa_dy = math.nan
         self.fpa_stride_time = math.nan
+        self.foot_roll = math.nan
+        self.foot_pitch = math.nan
+        self.foot_yaw = math.nan
 
         # UI layout
         central = QtWidgets.QWidget(self)
@@ -247,6 +295,23 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.plot_fpa.showGrid(x=True, y=True, alpha=0.3)
         self.cur_fpa = self.plot_fpa.plot([], [], pen=pg.mkPen((255,255,120), width=2), name="FPA")
 
+        self.glview = None
+        self.axis_items = []
+        self.axis_len = 0.15
+        if HAVE_GL:
+            self.glview = gl.GLViewWidget()
+            self.glview.setBackgroundColor((30, 30, 30, 255))
+            self.glview.opts['distance'] = 0.6
+            self.glview.opts['elevation'] = 18
+            self.glview.opts['azimuth'] = 45
+            grid = gl.GLGridItem()
+            grid.scale(0.1, 0.1, 0.1)
+            self.glview.addItem(grid)
+            self._init_foot_axes()
+            vbox.addWidget(self.glview, stretch=1)
+        else:
+            print("[imu_printfpa] pyqtgraph.opengl not available; 3D foot axis disabled", file=sys.stderr)
+
         # Reader thread + timer to drain queue
         self.q = queue.Queue(maxsize=args.queue_max)
         self.stop_evt = threading.Event()
@@ -293,6 +358,56 @@ class IMUWindow(QtWidgets.QMainWindow):
         ts = [t for (t, _) in d]
         vs = [v for (_, v) in d]
         return ts, vs
+
+    def pull_latest_foot_orientation(self):
+        roll, pitch, yaw = FOOT_ORIENTATION.snapshot()
+        self.foot_roll = roll
+        self.foot_pitch = pitch
+        self.foot_yaw = yaw
+
+    @staticmethod
+    def _rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
+        roll = math.radians(roll_deg)
+        pitch = math.radians(pitch_deg)
+        yaw = math.radians(yaw_deg)
+        sr, cr = math.sin(roll), math.cos(roll)
+        sp, cp = math.sin(pitch), math.cos(pitch)
+        sy, cy = math.sin(yaw), math.cos(yaw)
+        return np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp,     cp * sr,                 cp * cr               ]
+        ], dtype=float)
+
+    def _init_foot_axes(self):
+        if not HAVE_GL or self.glview is None:
+            return
+        colors = [
+            (1.0, 0.2, 0.2, 1.0),  # X axis (red)
+            (0.2, 1.0, 0.2, 1.0),  # Y axis (green)
+            (0.2, 0.4, 1.0, 1.0),  # Z axis (blue)
+        ]
+        origin = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float)
+        for color in colors:
+            item = gl.GLLinePlotItem(pos=origin.copy(), color=color, width=3, antialias=True, mode='line_strip')
+            self.axis_items.append(item)
+            self.glview.addItem(item)
+        self.update_foot_axes(force_identity=True)
+
+    def update_foot_axes(self, force_identity=False):
+        if not HAVE_GL or self.glview is None or not self.axis_items:
+            return
+        if force_identity:
+            roll = pitch = yaw = 0.0
+        else:
+            roll = self.foot_roll if math.isfinite(self.foot_roll) else 0.0
+            pitch = self.foot_pitch if math.isfinite(self.foot_pitch) else 0.0
+            yaw = self.foot_yaw if math.isfinite(self.foot_yaw) else 0.0
+        R = self._rpy_to_matrix(roll, pitch, yaw)
+        for idx in range(3):
+            axis_vec = R[:, idx] * self.axis_len
+            pts = np.array([[0.0, 0.0, 0.0], axis_vec], dtype=float)
+            self.axis_items[idx].setData(pos=pts)
 
     def on_timer(self):
         # drain queue
@@ -369,6 +484,9 @@ class IMUWindow(QtWidgets.QMainWindow):
                 self.fpa_dy = dy if (dy is not None and math.isfinite(dy)) else math.nan
                 self.fpa_stride_time = stride_time if (stride_time is not None and math.isfinite(stride_time)) else math.nan
 
+        self.pull_latest_foot_orientation()
+        self.update_foot_axes()
+
         # update curves if we got anything
         if drained:
             # x-range: last window
@@ -413,6 +531,8 @@ class IMUWindow(QtWidgets.QMainWindow):
                 status.append(f"FPA: {self.fpa_latest:.1f}° ({stride_txt})")
                 if math.isfinite(self.fpa_stride_time):
                     status.append(f"Ts={self.fpa_stride_time:.2f}s")
+            if math.isfinite(self.foot_roll) and math.isfinite(self.foot_pitch) and math.isfinite(self.foot_yaw):
+                status.append(f"Foot r/p/y={self.foot_roll:.1f}/{self.foot_pitch:.1f}/{self.foot_yaw:.1f}°")
             self.status.showMessage("  |  ".join(status))
 
 

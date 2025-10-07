@@ -28,6 +28,30 @@ static float g_lastFootRollDeg = NAN;
 static float g_lastFootPitchDeg = NAN;
 static float g_lastFootYawDeg = NAN;
 
+static void quatToEulerDeg(const float q[4], float* outRollDeg, float* outPitchDeg, float* outYawDeg) {
+  // q = (w, x, y, z)
+  float sinr_cosp = 2.0f * (q[0]*q[1] + q[2]*q[3]);
+  float cosr_cosp = 1.0f - 2.0f * (q[1]*q[1] + q[2]*q[2]);
+  float roll = atan2f(sinr_cosp, cosr_cosp);
+
+  float sinp = 2.0f * (q[0]*q[2] - q[3]*q[1]);
+  float pitch;
+  if (fabsf(sinp) >= 1.0f) {
+    pitch = copysignf(1.57079632679f, sinp); // clamp to +-pi/2
+  } else {
+    pitch = asinf(sinp);
+  }
+
+  float siny_cosp = 2.0f * (q[0]*q[3] + q[1]*q[2]);
+  float cosy_cosp = 1.0f - 2.0f * (q[2]*q[2] + q[3]*q[3]);
+  float yaw = atan2f(siny_cosp, cosy_cosp);
+
+  const float RAD2DEG = 57.29577951308232f;
+  if (outRollDeg) *outRollDeg = roll * RAD2DEG;
+  if (outPitchDeg) *outPitchDeg = pitch * RAD2DEG;
+  if (outYawDeg) *outYawDeg = yaw * RAD2DEG;
+}
+
 // ====== IMU + VQF config ======
 static const float GYR_HZ = 400.0f;   // gyro  rate
 static const float ACC_HZ = 100.0f;   // accel rate
@@ -215,6 +239,8 @@ void loop() {
       float q[4] = { static_cast<float>(q6[0]), static_cast<float>(q6[1]), static_cast<float>(q6[2]), static_cast<float>(q6[3]) };
       float acc_f[3] = { static_cast<float>(acc[0]), static_cast<float>(acc[1]), static_cast<float>(acc[2]) };
       float gyr_f[3] = { static_cast<float>(gyr[0]), static_cast<float>(gyr[1]), static_cast<float>(gyr[2]) };
+      quatToEulerDeg(q, &g_lastFootRollDeg, &g_lastFootPitchDeg, &g_lastFootYawDeg);
+      g_lastFootValid = true;
       g_fpa.feed(acc_f, gyr_f, q, dt);
       g_lastFeedAccepted = true;
     }
@@ -237,7 +263,7 @@ void loop() {
   }
 
   uint32_t nowMs = millis();
-  if (nowMs - g_lastDebugMs > 500) {
+  if (nowMs - g_lastDebugMs > 250) {
     FPA_Debug dbg;
     g_fpa.getDebug(&dbg);
     float acc_norm = sqrtf(acc[0]*acc[0] + acc[1]*acc[1] + acc[2]*acc[2]);
@@ -285,14 +311,10 @@ void loop() {
       g_lastFootYawDeg = dbg.last_foot_yaw_deg;
     }
 
-    if (g_lastFootValid && !isnan(g_lastFootRollDeg) && !isnan(g_lastFootPitchDeg) && !isnan(g_lastFootYawDeg)) {
-      Serial.printf(" footDeg(r/p/y)=%.1f/%.1f/%.1f",
-                    g_lastFootRollDeg,
-                    g_lastFootPitchDeg,
-                    g_lastFootYawDeg);
-    } else {
-      Serial.print(" footDeg=nan");
-    }
+    Serial.printf(" footDeg(r/p/y)=%.1f/%.1f/%.1f",
+                  g_lastFootValid && !isnan(g_lastFootRollDeg) ? g_lastFootRollDeg : NAN,
+                  g_lastFootValid && !isnan(g_lastFootPitchDeg) ? g_lastFootPitchDeg : NAN,
+                  g_lastFootValid && !isnan(g_lastFootYawDeg) ? g_lastFootYawDeg : NAN);
 
     Serial.printf(" reject=%d\n", dbg.last_reject_reason);
     g_lastDebugMs = nowMs;
