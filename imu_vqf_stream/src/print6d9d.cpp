@@ -11,19 +11,6 @@ extern "C" {
   #include "vqf.h" // community VQF-C header you dropped in lib/vqf_c
 }
 
-// --- Foot Progression Angle ---
-#include "FPA.hpp"
-static FPA g_fpa(/*is_left_foot=*/false); // set to false if this sensor is on the RIGHT foot
-static uint32_t g_lastFeedUs = 0;
-static float g_lastFeedDt = 0.0f;
-static bool g_lastFeedAccepted = false;
-static uint32_t g_lastDebugMs = 0;
-static uint32_t g_lastStridePrinted = 0;
-static float g_lastFpaDeg = NAN;
-static float g_lastStrideDuration = 0.0f;
-static float g_lastStrideDx = 0.0f;
-static float g_lastStrideDy = 0.0f;
-
 // ====== IMU + VQF config ======
 static const float GYR_HZ = 400.0f;   // gyro  rate
 static const float ACC_HZ = 100.0f;   // accel rate
@@ -36,12 +23,6 @@ static const uint32_t MAG_US = (uint32_t)(1e6f / MAG_HZ);
 static const float GYR_DT = 1.0f / GYR_HZ;
 static const float ACC_DT = 1.0f / ACC_HZ;
 static const float MAG_DT = 1.0f / MAG_HZ;
-
-static const float FPA_ACC_DIFF_TH = 0.25f;
-static const float FPA_GYR_NORM_TH = 0.7f;
-static const float FPA_HYS_FRAC = 0.2f;
-static const float FPA_MIN_REST_S = 0.05f;
-static const float FPA_MIN_MOTION_S = 0.05f;
 
 // Optional: override I2C pins if your wiring needs it.
 // #define I2C_SDA 21
@@ -69,11 +50,11 @@ static void printCsvSample(float t_ms) {
   if (haveMagSample) {
     Serial.print(mag[0], 6);  Serial.print(',');
     Serial.print(mag[1], 6);  Serial.print(',');
-    Serial.print(mag[2], 6);
+    Serial.println(mag[2], 6);
   } else {
     Serial.print("nan");      Serial.print(',');
     Serial.print("nan");      Serial.print(',');
-    Serial.print("nan");
+    Serial.println("nan");
   }
 }
 
@@ -138,9 +119,6 @@ void setup() {
   initVqf(GYR_DT, ACC_DT, MAG_DT);
 
   streamStartUs = micros();
-  g_lastFeedUs = 0;
-  g_fpa.reset();
-  g_fpa.configure(FPA_ACC_DIFF_TH, FPA_GYR_NORM_TH, FPA_HYS_FRAC, FPA_MIN_REST_S, FPA_MIN_MOTION_S);
 
   Serial.println(F("Setup OK. Streaming..."));
 }
@@ -186,88 +164,5 @@ void loop() {
     printCsvSample(t_ms);
     haveNewGyr = false;
     haveNewAcc = false;
-    // --- Feed FPA estimator once per fused sample ---
-    g_lastFeedAccepted = false;
-    float dt = 0.0f;
-    if (g_lastFeedUs != 0) {
-      uint32_t deltaUs = nowUs - g_lastFeedUs;
-      dt = deltaUs * 1e-6f;
-    }
-    g_lastFeedUs = nowUs;
-    g_lastFeedDt = dt;
-
-    if (dt > 0.0f && dt < 0.2f) {
-      vqf_real_t q6[4];
-      getQuat6D(q6);
-      float q[4] = { static_cast<float>(q6[0]), static_cast<float>(q6[1]), static_cast<float>(q6[2]), static_cast<float>(q6[3]) };
-      float acc_f[3] = { static_cast<float>(acc[0]), static_cast<float>(acc[1]), static_cast<float>(acc[2]) };
-      float gyr_f[3] = { static_cast<float>(gyr[0]), static_cast<float>(gyr[1]), static_cast<float>(gyr[2]) };
-      g_fpa.feed(acc_f, gyr_f, q, dt);
-      g_lastFeedAccepted = true;
-    }
-
-    FPA_Result r;
-    if (g_fpa.poll(&r) && r.valid) {
-      Serial.printf(",FPA_deg=%.2f,stride=%lu,dx=%.3f,dy=%.3f,Ts=%.3f",
-                    r.fpa_deg,
-                    static_cast<unsigned long>(r.stride_index),
-                    r.delta_xy_m[0],
-                    r.delta_xy_m[1],
-                    r.stride_duration_s);
-      g_lastStridePrinted = r.stride_index;
-      g_lastFpaDeg = r.fpa_deg;
-      g_lastStrideDuration = r.stride_duration_s;
-      g_lastStrideDx = r.delta_xy_m[0];
-      g_lastStrideDy = r.delta_xy_m[1];
-    }
-    Serial.println();
-  }
-
-  uint32_t nowMs = millis();
-  if (nowMs - g_lastDebugMs > 500) {
-    FPA_Debug dbg;
-    g_fpa.getDebug(&dbg);
-    float acc_norm = sqrtf(acc[0]*acc[0] + acc[1]*acc[1] + acc[2]*acc[2]);
-    float acc_diff = fabsf(acc_norm - 9.81f);
-    float gyr_norm = sqrtf(gyr[0]*gyr[0] + gyr[1]*gyr[1] + gyr[2]*gyr[2]);
-    Serial.printf(
-      "# FPA dbg: stride=%lu state=%d raw=%d have(hr=%d fc=%d trest=%d) samples=%d grav=%lu accDiff=%.3f (>%.2f?) gyrNorm=%.3f (>%.2f?) dt=%.4f accepted=%d",
-      static_cast<unsigned long>(dbg.stride_index),
-      dbg.state,
-      dbg.state_raw,
-      dbg.have_thr ? 1 : 0,
-      dbg.have_tfc ? 1 : 0,
-      dbg.have_trest ? 1 : 0,
-      dbg.sample_count,
-      static_cast<unsigned long>(dbg.grav_count),
-      acc_diff,
-      dbg.acc_thr,
-      gyr_norm,
-      dbg.gyr_thr,
-      g_lastFeedDt,
-      g_lastFeedAccepted ? 1 : 0);
-
-    if (dbg.last_result_valid) {
-      Serial.printf(" lastFpaDeg=%.2f stride=%lu Ts=%.3f dx=%.3f dy=%.3f",
-                    dbg.last_result_fpa_deg,
-                    static_cast<unsigned long>(dbg.last_result_stride_index),
-                    dbg.last_result_stride_duration_s,
-                    dbg.last_result_dx,
-                    dbg.last_result_dy);
-    } else if (!isnan(g_lastFpaDeg)) {
-      Serial.printf(" lastFpaDeg=%.2f stride=%lu Ts=%.3f dx=%.3f dy=%.3f",
-                    g_lastFpaDeg,
-                    static_cast<unsigned long>(g_lastStridePrinted),
-                    g_lastStrideDuration,
-                    g_lastStrideDx,
-                    g_lastStrideDy);
-    } else {
-      Serial.print(" lastFpaDeg=nan");
-    }
-
-    Serial.printf(" reject=%d\n", dbg.last_reject_reason);
-    g_lastDebugMs = nowMs;
-    Serial.println();
-
   }
 }
