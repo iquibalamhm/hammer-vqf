@@ -48,6 +48,10 @@ struct FPA_Debug {
   float last_result_dy;
   uint32_t last_result_stride_index;
   int last_reject_reason; // 0=ok, 1=no samples buffered, 2=stride too short
+  bool last_foot_valid;
+  float last_foot_roll_deg;
+  float last_foot_pitch_deg;
+  float last_foot_yaw_deg;
 };
 
 class FPA {
@@ -126,6 +130,28 @@ private:
     return a;
   }
   static inline float rad2deg(float r) { return r * 57.29577951308232f; }
+  static inline void quat_to_euler_zyx(const float q[4], float* roll, float* pitch, float* yaw) {
+    // q = (w, x, y, z)
+    float sinr_cosp = 2.0f * (q[0]*q[1] + q[2]*q[3]);
+    float cosr_cosp = 1.0f - 2.0f * (q[1]*q[1] + q[2]*q[2]);
+    float roll_val = atan2f(sinr_cosp, cosr_cosp);
+
+    float sinp = 2.0f * (q[0]*q[2] - q[3]*q[1]);
+    float pitch_val;
+    if (fabsf(sinp) >= 1.0f) {
+      pitch_val = copysignf(1.57079632679f, sinp); // pi/2
+    } else {
+      pitch_val = asinf(sinp);
+    }
+
+    float siny_cosp = 2.0f * (q[0]*q[3] + q[1]*q[2]);
+    float cosy_cosp = 1.0f - 2.0f * (q[2]*q[2] + q[3]*q[3]);
+    float yaw_val = atan2f(siny_cosp, cosy_cosp);
+
+    if (roll) *roll = roll_val;
+    if (pitch) *pitch = pitch_val;
+    if (yaw) *yaw = yaw_val;
+  }
 
   // Create foot-to-sensor quaternion q_FS from estimated axes (columns are foot axes in S)
   static void rotm_to_quat_FS(const float yF_S[3], const float zF_S[3], float q_FS[4]);
@@ -177,6 +203,10 @@ private:
   FPA_Result last_debug_result_;
   bool last_debug_valid_;
   int last_reject_reason_;
+  bool last_foot_valid_;
+  float last_foot_roll_deg_;
+  float last_foot_pitch_deg_;
+  float last_foot_yaw_deg_;
   
   // helpers
   void update_state_(float accDiff, float gyrNorm);
@@ -202,7 +232,11 @@ FPA::FPA(bool is_left_foot)
   stride_idx_(0),
   last_debug_result_{false, NAN, 0.0f, {0.0f,0.0f}, 0},
   last_debug_valid_(false),
-  last_reject_reason_(REJECT_NONE)
+  last_reject_reason_(REJECT_NONE),
+  last_foot_valid_(false),
+  last_foot_roll_deg_(NAN),
+  last_foot_pitch_deg_(NAN),
+  last_foot_yaw_deg_(NAN)
 {
   memset(buf_t_, 0, sizeof(buf_t_));
   memset(buf_dt_, 0, sizeof(buf_dt_));
@@ -234,6 +268,10 @@ void FPA::reset() {
   last_debug_result_ = last_;
   last_debug_valid_ = false;
   last_reject_reason_ = REJECT_NONE;
+  last_foot_valid_ = false;
+  last_foot_roll_deg_ = NAN;
+  last_foot_pitch_deg_ = NAN;
+  last_foot_yaw_deg_ = NAN;
   stride_idx_=0;
 }
 
@@ -337,6 +375,7 @@ void FPA::maybe_finalize_trest_() {
 
 void FPA::integrate_and_compute_() {
   if (!have_trest_ || stride_idx_ < 1) return;
+  last_foot_valid_ = false;
   // Find sample index closest to previous and current t_rest
   float t0 = last_trest_time_; // this is the "current" t_rest (end); we need previous end
   // To get previous t_rest time, we must store it. We'll approximate using the earliest time in buffer.
@@ -410,6 +449,8 @@ void FPA::integrate_and_compute_() {
   float ex[3] = {1,0,0}, fwdE[3];
   quat_rotate_vec(q_FE0, ex, fwdE);
   float yaw_foot = atan2f(fwdE[1], fwdE[0]);
+  float roll_foot = 0.0f, pitch_foot = 0.0f;
+  quat_to_euler_zyx(q_FE0, &roll_foot, &pitch_foot, &yaw_foot);
 
   float fpa = wrap_pi(yaw_foot - d_heading);
   if (!is_left_) fpa = -fpa; // positive out-toeing for both feet
@@ -423,6 +464,10 @@ void FPA::integrate_and_compute_() {
   last_debug_result_ = last_;
   last_debug_valid_ = true;
   last_reject_reason_ = REJECT_NONE;
+  last_foot_valid_ = true;
+  last_foot_roll_deg_ = rad2deg(roll_foot);
+  last_foot_pitch_deg_ = rad2deg(pitch_foot);
+  last_foot_yaw_deg_ = rad2deg(yaw_foot);
 
   // Drop consumed samples to avoid buffer growth; keep buffer ready for next stride
   n_ = 0;
@@ -487,6 +532,10 @@ void FPA::getDebug(FPA_Debug* out) const {
   out->last_result_dy = last_debug_valid_ ? last_debug_result_.delta_xy_m[1] : 0.0f;
   out->last_result_stride_index = last_debug_valid_ ? last_debug_result_.stride_index : 0;
   out->last_reject_reason = last_reject_reason_;
+  out->last_foot_valid = last_foot_valid_;
+  out->last_foot_roll_deg = last_foot_valid_ ? last_foot_roll_deg_ : NAN;
+  out->last_foot_pitch_deg = last_foot_valid_ ? last_foot_pitch_deg_ : NAN;
+  out->last_foot_yaw_deg = last_foot_valid_ ? last_foot_yaw_deg_ : NAN;
 }
 
 #endif // FPA_NO_IMPLEMENTATION

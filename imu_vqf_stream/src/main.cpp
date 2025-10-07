@@ -23,6 +23,10 @@ static float g_lastFpaDeg = NAN;
 static float g_lastStrideDuration = 0.0f;
 static float g_lastStrideDx = 0.0f;
 static float g_lastStrideDy = 0.0f;
+static bool g_lastFootValid = false;
+static float g_lastFootRollDeg = NAN;
+static float g_lastFootPitchDeg = NAN;
+static float g_lastFootYawDeg = NAN;
 
 // ====== IMU + VQF config ======
 static const float GYR_HZ = 400.0f;   // gyro  rate
@@ -141,6 +145,15 @@ void setup() {
   g_lastFeedUs = 0;
   g_fpa.reset();
   g_fpa.configure(FPA_ACC_DIFF_TH, FPA_GYR_NORM_TH, FPA_HYS_FRAC, FPA_MIN_REST_S, FPA_MIN_MOTION_S);
+  g_lastStridePrinted = 0;
+  g_lastFpaDeg = NAN;
+  g_lastStrideDuration = 0.0f;
+  g_lastStrideDx = 0.0f;
+  g_lastStrideDy = 0.0f;
+  g_lastFootValid = false;
+  g_lastFootRollDeg = NAN;
+  g_lastFootPitchDeg = NAN;
+  g_lastFootYawDeg = NAN;
 
   Serial.println(F("Setup OK. Streaming..."));
 }
@@ -263,6 +276,22 @@ void loop() {
                     g_lastStrideDy);
     } else {
       Serial.print(" lastFpaDeg=nan");
+    }
+
+    if (dbg.last_foot_valid) {
+      g_lastFootValid = true;
+      g_lastFootRollDeg = dbg.last_foot_roll_deg;
+      g_lastFootPitchDeg = dbg.last_foot_pitch_deg;
+      g_lastFootYawDeg = dbg.last_foot_yaw_deg;
+    }
+
+    if (g_lastFootValid && !isnan(g_lastFootRollDeg) && !isnan(g_lastFootPitchDeg) && !isnan(g_lastFootYawDeg)) {
+      Serial.printf(" footDeg(r/p/y)=%.1f/%.1f/%.1f",
+                    g_lastFootRollDeg,
+                    g_lastFootPitchDeg,
+                    g_lastFootYawDeg);
+    } else {
+      Serial.print(" footDeg=nan");
     }
 
     Serial.printf(" reject=%d\n", dbg.last_reject_reason);
