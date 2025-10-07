@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_BNO08x.h>
+#include <math.h>
 
 // I2C address for BNO085/BNO08x (default is usually 0x4A). Define it here
 // if your board uses a different address.
@@ -32,22 +33,29 @@ bool bnoPresent = false;
 
 // latest samples
 vqf_real_t gyr[3] = {0}, acc[3] = {0}, mag[3] = {0};
-bool haveNewGyr = false, haveNewAcc = false, haveNewMag = false;
+bool haveNewGyr = false, haveNewAcc = false;
+bool haveGyrSample = false, haveAccSample = false, haveMagSample = false;
 
-// --- after (use out-parameters only) ---
-static inline void readQuat6(vqf_real_t out[4]) {
-  getQuat6D(out);
-}
-static inline void readQuat9(vqf_real_t out[4]) {
-  getQuat9D(out);
-}
+static uint32_t streamStartUs = 0;
 
-static inline void printQuat(const char* tag, const vqf_real_t q[4]) {
-  Serial.print(tag); Serial.print(':');
-  Serial.print(' '); Serial.print(q[0], 6);
-  Serial.print(' '); Serial.print(q[1], 6);
-  Serial.print(' '); Serial.print(q[2], 6);
-  Serial.print(' '); Serial.println(q[3], 6);
+static void printCsvSample(float t_ms) {
+  Serial.print(t_ms, 3);      Serial.print(',');
+  Serial.print(acc[0], 6);    Serial.print(',');
+  Serial.print(acc[1], 6);    Serial.print(',');
+  Serial.print(acc[2], 6);    Serial.print(',');
+  Serial.print(gyr[0], 6);    Serial.print(',');
+  Serial.print(gyr[1], 6);    Serial.print(',');
+  Serial.print(gyr[2], 6);    Serial.print(',');
+
+  if (haveMagSample) {
+    Serial.print(mag[0], 6);  Serial.print(',');
+    Serial.print(mag[1], 6);  Serial.print(',');
+    Serial.println(mag[2], 6);
+  } else {
+    Serial.print("nan");      Serial.print(',');
+    Serial.print("nan");      Serial.print(',');
+    Serial.println("nan");
+  }
 }
 
 void setup() {
@@ -110,6 +118,8 @@ void setup() {
   // Initialize VQF with per-sensor sample times (s)
   initVqf(GYR_DT, ACC_DT, MAG_DT);
 
+  streamStartUs = micros();
+
   Serial.println(F("Setup OK. Streaming..."));
 }
 
@@ -124,6 +134,7 @@ void loop() {
         gyr[2] = evt.un.gyroscope.z;
         updateGyr(gyr);
         haveNewGyr = true;
+        haveGyrSample = true;
         break;
 
       case SH2_ACCELEROMETER:
@@ -133,6 +144,7 @@ void loop() {
         acc[2] = evt.un.accelerometer.z;
         updateAcc(acc);
         haveNewAcc = true;
+        haveAccSample = true;
         break;
 
       case SH2_MAGNETIC_FIELD_UNCALIBRATED:
@@ -141,23 +153,16 @@ void loop() {
         mag[1] = evt.un.magneticField.y;
         mag[2] = evt.un.magneticField.z;
         updateMag(mag);
-        haveNewMag = true;
+        haveMagSample = true;
         break;
     }
   }
 
-  // Print when state advanced
-  if (haveNewGyr || haveNewAcc) {
-    vqf_real_t q6[4];
-    readQuat6(q6);
-    printQuat("q6", q6);
-    haveNewGyr = haveNewAcc = false;
-  }
-
-  if (haveNewMag) {
-    vqf_real_t q9[4];
-    readQuat9(q9);
-    printQuat("q9", q9);
-    haveNewMag = false;
+  if ((haveNewGyr || haveNewAcc) && haveGyrSample && haveAccSample) {
+    uint32_t nowUs = micros();
+    float t_ms = (nowUs - streamStartUs) * 0.001f;
+    printCsvSample(t_ms);
+    haveNewGyr = false;
+    haveNewAcc = false;
   }
 }
