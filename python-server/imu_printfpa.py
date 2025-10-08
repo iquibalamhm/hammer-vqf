@@ -12,6 +12,7 @@ Examples:
   python imu_printfpa.py --port /dev/ttyACM0 --baud 115200 --gyro-units rad
   python imu_printfpa.py --file sample.csv --gyro-units rad
   python imu_printfpa.py --file sample.csv --no-orientation
+    python imu_printfpa.py --file sample.csv --plots accel gyro fpa
 """
 import sys, math, time, threading, queue, argparse, re
 from collections import deque
@@ -61,10 +62,15 @@ class FootOrientationState:
 
 
 FOOT_ORIENTATION = FootOrientationState()
-FOOT_DEBUG_RE = re.compile(r"footDeg\(r/p/y\)=([\-\d\.]+|nan)/([\-\d\.]+|nan)/([\-\d\.]+|nan)")
+FOOT_DEBUG_RE = re.compile(
+    r"footRoll_deg=([-+]?\d*\.?\d+|nan),"
+    r"footPitch_deg=([-+]?\d*\.?\d+|nan),"
+    r"footYaw_deg=([-+]?\d*\.?\d+|nan)",
+    re.IGNORECASE,
+)
 
 
-def update_foot_orientation_from_debug(line: str):
+def update_foot_orientation_from_serial(line: str):
     m = FOOT_DEBUG_RE.search(line)
     if not m:
         return
@@ -90,6 +96,11 @@ def parse_args():
     ap.add_argument("--no-orientation", action="store_true",
                     help="Disable VQF orientation")
     ap.add_argument("--queue-max", type=int, default=10000, help="Reader→GUI queue size")
+    ap.add_argument("--plots", nargs="+",
+                    choices=["accel", "gyro", "mag", "orientation", "fpa", "foot-axis"],
+                    default=["accel", "gyro", "mag", "orientation", "fpa", "foot-axis"],
+                    help="Plots to display (e.g. --plots accel gyro fpa foot-axis). Default shows all;"
+                         " foot-axis requires pyqtgraph.opengl.")
     return ap.parse_args()
 
 
@@ -109,10 +120,11 @@ def parse_line(line):
         return None
     if s.startswith("# FPA dbg"):
         print(s)
-        update_foot_orientation_from_debug(s)
         return None
     if s.startswith("#"):
         return None
+    update_foot_orientation_from_serial(s)
+    # print(FOOT_ORIENTATION.snapshot())
     parts = s.split(",")
     if len(parts) < 10: return None
     base_fields = parts[:10]
@@ -223,19 +235,44 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.args = args
         self.win = args.window
 
+        # Determine which plots are active
+        all_plots = ["accel", "gyro", "mag", "orientation", "fpa", "foot-axis"]
+        self.plots_enabled = set(args.plots or all_plots)
+        if "foot-axis" in self.plots_enabled and not HAVE_GL:
+            print("[imu_printfpa] foot-axis plot requested but pyqtgraph.opengl not available; disabling.",
+                  file=sys.stderr)
+            self.plots_enabled.discard("foot-axis")
+
+        orientation_requested = "orientation" in self.plots_enabled
+        self.use_vqf = (not args.no_orientation) and HAVE_VQF and orientation_requested
+        if orientation_requested and not self.use_vqf:
+            if args.no_orientation:
+                reason = "disabled via --no-orientation"
+            elif not HAVE_VQF:
+                reason = "vqf module not installed"
+            else:
+                reason = "orientation unavailable"
+            print(f"[imu_printfpa] orientation plot unavailable ({reason}); disabling.",
+                  file=sys.stderr)
+            self.plots_enabled.discard("orientation")
+
         # Data buffers (deques of (t, value))
         self.t0 = None
         self.t_last = 0.0
-        self.buf = {
-            "ax": deque(), "ay": deque(), "az": deque(),
-            "gx": deque(), "gy": deque(), "gz": deque(),
-            "mx": deque(), "my": deque(), "mz": deque(),
-            "roll": deque(), "pitch": deque(), "yaw": deque(),
-            "fpa": deque(),
-        }
+        self.buf = {}
+        if "accel" in self.plots_enabled:
+            self.buf.update({"ax": deque(), "ay": deque(), "az": deque()})
+        if "gyro" in self.plots_enabled:
+            self.buf.update({"gx": deque(), "gy": deque(), "gz": deque()})
+        if "mag" in self.plots_enabled:
+            self.buf.update({"mx": deque(), "my": deque(), "mz": deque()})
+        if "orientation" in self.plots_enabled:
+            self.buf.update({"roll": deque(), "pitch": deque(), "yaw": deque()})
+        if "fpa" in self.plots_enabled:
+            self.buf["fpa"] = deque()
+        self._samples_key = next(iter(self.buf), None)
 
         # Orientation (optional)
-        self.use_vqf = (not args.no_orientation) and HAVE_VQF
         self.vqf = VQF() if self.use_vqf else None
         self.prev_t = None
 
@@ -249,6 +286,12 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.foot_pitch = math.nan
         self.foot_yaw = math.nan
 
+        self.plot_acc = self.cur_ax = self.cur_ay = self.cur_az = None
+        self.plot_gyr = self.cur_gx = self.cur_gy = self.cur_gz = None
+        self.plot_mag = self.cur_mx = self.cur_my = self.cur_mz = None
+        self.plot_rpy = self.cur_roll = self.cur_pitch = self.cur_yaw = None
+        self.plot_fpa = self.cur_fpa = None
+
         # UI layout
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
@@ -256,49 +299,58 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.glw = pg.GraphicsLayoutWidget(show=True)
         vbox.addWidget(self.glw)
 
-        # Plots: Accel, Gyro, Mag, (optional) Orientation
-        self.plot_acc = self.glw.addPlot(title="Acceleration (m/s²)")
-        self.plot_acc.addLegend()
-        self.plot_acc.showGrid(x=True, y=True, alpha=0.3)
-        self.cur_ax = self.plot_acc.plot([], [], pen=pg.mkPen((255,120,120), width=2), name="ax")
-        self.cur_ay = self.plot_acc.plot([], [], pen=pg.mkPen((120,255,120), width=2), name="ay")
-        self.cur_az = self.plot_acc.plot([], [], pen=pg.mkPen((120,170,255), width=2), name="az")
+        layout_started = False
 
-        self.glw.nextRow()
-        self.plot_gyr = self.glw.addPlot(title="Gyroscope (deg/s)")
-        self.plot_gyr.addLegend()
-        self.plot_gyr.showGrid(x=True, y=True, alpha=0.3)
-        self.cur_gx = self.plot_gyr.plot([], [], pen=pg.mkPen((255,180,120), width=2), name="gx")
-        self.cur_gy = self.plot_gyr.plot([], [], pen=pg.mkPen((180,255,120), width=2), name="gy")
-        self.cur_gz = self.plot_gyr.plot([], [], pen=pg.mkPen((180,200,255), width=2), name="gz")
+        def make_plot(title: str):
+            nonlocal layout_started
+            if layout_started:
+                self.glw.nextRow()
+            else:
+                layout_started = True
+            return self.glw.addPlot(title=title)
 
-        self.glw.nextRow()
-        self.plot_mag = self.glw.addPlot(title="Magnetometer (µT)")
-        self.plot_mag.addLegend()
-        self.plot_mag.showGrid(x=True, y=True, alpha=0.3)
-        self.cur_mx = self.plot_mag.plot([], [], pen=pg.mkPen((255,220,120), width=2), name="mx")
-        self.cur_my = self.plot_mag.plot([], [], pen=pg.mkPen((160,255,200), width=2), name="my")
-        self.cur_mz = self.plot_mag.plot([], [], pen=pg.mkPen((200,200,255), width=2), name="mz")
+        if "accel" in self.plots_enabled:
+            self.plot_acc = make_plot("Acceleration (m/s²)")
+            self.plot_acc.addLegend()
+            self.plot_acc.showGrid(x=True, y=True, alpha=0.3)
+            self.cur_ax = self.plot_acc.plot([], [], pen=pg.mkPen((255,120,120), width=2), name="ax")
+            self.cur_ay = self.plot_acc.plot([], [], pen=pg.mkPen((120,255,120), width=2), name="ay")
+            self.cur_az = self.plot_acc.plot([], [], pen=pg.mkPen((120,170,255), width=2), name="az")
 
-        if self.use_vqf:
-            self.glw.nextRow()
-            self.plot_rpy = self.glw.addPlot(title="Orientation (VQF, deg)")
+        if "gyro" in self.plots_enabled:
+            self.plot_gyr = make_plot("Gyroscope (deg/s)")
+            self.plot_gyr.addLegend()
+            self.plot_gyr.showGrid(x=True, y=True, alpha=0.3)
+            self.cur_gx = self.plot_gyr.plot([], [], pen=pg.mkPen((255,180,120), width=2), name="gx")
+            self.cur_gy = self.plot_gyr.plot([], [], pen=pg.mkPen((180,255,120), width=2), name="gy")
+            self.cur_gz = self.plot_gyr.plot([], [], pen=pg.mkPen((180,200,255), width=2), name="gz")
+
+        if "mag" in self.plots_enabled:
+            self.plot_mag = make_plot("Magnetometer (µT)")
+            self.plot_mag.addLegend()
+            self.plot_mag.showGrid(x=True, y=True, alpha=0.3)
+            self.cur_mx = self.plot_mag.plot([], [], pen=pg.mkPen((255,220,120), width=2), name="mx")
+            self.cur_my = self.plot_mag.plot([], [], pen=pg.mkPen((160,255,200), width=2), name="my")
+            self.cur_mz = self.plot_mag.plot([], [], pen=pg.mkPen((200,200,255), width=2), name="mz")
+
+        if "orientation" in self.plots_enabled and self.use_vqf:
+            self.plot_rpy = make_plot("Orientation (VQF, deg)")
             self.plot_rpy.addLegend()
             self.plot_rpy.showGrid(x=True, y=True, alpha=0.3)
             self.cur_roll  = self.plot_rpy.plot([], [], pen=pg.mkPen((255,140,140), width=2), name="roll")
             self.cur_pitch = self.plot_rpy.plot([], [], pen=pg.mkPen((140,255,140), width=2), name="pitch")
             self.cur_yaw   = self.plot_rpy.plot([], [], pen=pg.mkPen((140,140,255), width=2), name="yaw")
 
-        self.glw.nextRow()
-        self.plot_fpa = self.glw.addPlot(title="Foot Progression Angle (deg)")
-        self.plot_fpa.addLegend()
-        self.plot_fpa.showGrid(x=True, y=True, alpha=0.3)
-        self.cur_fpa = self.plot_fpa.plot([], [], pen=pg.mkPen((255,255,120), width=2), name="FPA")
+        if "fpa" in self.plots_enabled:
+            self.plot_fpa = make_plot("Foot Progression Angle (deg)")
+            self.plot_fpa.addLegend()
+            self.plot_fpa.showGrid(x=True, y=True, alpha=0.3)
+            self.cur_fpa = self.plot_fpa.plot([], [], pen=pg.mkPen((255,255,120), width=2), name="FPA")
 
         self.glview = None
         self.axis_items = []
         self.axis_len = 0.15
-        if HAVE_GL:
+        if "foot-axis" in self.plots_enabled:
             self.glview = gl.GLViewWidget()
             self.glview.setBackgroundColor((30, 30, 30, 255))
             self.glview.opts['distance'] = 0.6
@@ -309,8 +361,6 @@ class IMUWindow(QtWidgets.QMainWindow):
             self.glview.addItem(grid)
             self._init_foot_axes()
             vbox.addWidget(self.glview, stretch=1)
-        else:
-            print("[imu_printfpa] pyqtgraph.opengl not available; 3D foot axis disabled", file=sys.stderr)
 
         # Reader thread + timer to drain queue
         self.q = queue.Queue(maxsize=args.queue_max)
@@ -345,7 +395,9 @@ class IMUWindow(QtWidgets.QMainWindow):
         return roll, pitch, yaw
 
     def append(self, key, t, val):
-        d = self.buf[key]
+        d = self.buf.get(key)
+        if d is None:
+            return
         d.append((t, val))
         # drop older than window
         t_cut = t - self.win
@@ -353,8 +405,9 @@ class IMUWindow(QtWidgets.QMainWindow):
             d.popleft()
 
     def series(self, key):
-        d = self.buf[key]
-        if not d: return [], []
+        d = self.buf.get(key)
+        if not d:
+            return [], []
         ts = [t for (t, _) in d]
         vs = [v for (_, v) in d]
         return ts, vs
@@ -484,6 +537,22 @@ class IMUWindow(QtWidgets.QMainWindow):
                 self.fpa_dy = dy if (dy is not None and math.isfinite(dy)) else math.nan
                 self.fpa_stride_time = stride_time if (stride_time is not None and math.isfinite(stride_time)) else math.nan
 
+                roll_extra = extras.get("footroll_deg")
+                if roll_extra is None:
+                    roll_extra = extras.get("footroll")
+                pitch_extra = extras.get("footpitch_deg")
+                if pitch_extra is None:
+                    pitch_extra = extras.get("footpitch")
+                yaw_extra = extras.get("footyaw_deg")
+                if yaw_extra is None:
+                    yaw_extra = extras.get("footyaw")
+                if (roll_extra is not None) or (pitch_extra is not None) or (yaw_extra is not None):
+                    FOOT_ORIENTATION.update(
+                        roll_extra if roll_extra is not None else math.nan,
+                        pitch_extra if pitch_extra is not None else math.nan,
+                        yaw_extra if yaw_extra is not None else math.nan,
+                    )
+
         self.pull_latest_foot_orientation()
         self.update_foot_axes()
 
@@ -494,32 +563,47 @@ class IMUWindow(QtWidgets.QMainWindow):
             x1 = self.t_last if self.t_last > 0 else self.win
 
             # accel
-            tx, axv = self.series("ax"); _, ayv = self.series("ay"); _, azv = self.series("az")
-            self.cur_ax.setData(tx, axv); self.cur_ay.setData(tx, ayv); self.cur_az.setData(tx, azv)
-            self.plot_acc.setXRange(x0, x1, padding=0.0)
+            if self.plot_acc is not None:
+                tx, axv = self.series("ax"); _, ayv = self.series("ay"); _, azv = self.series("az")
+                self.cur_ax.setData(tx, axv)
+                self.cur_ay.setData(tx, ayv)
+                self.cur_az.setData(tx, azv)
+                self.plot_acc.setXRange(x0, x1, padding=0.0)
 
             # gyro
-            tg, gxv = self.series("gx"); _, gyv = self.series("gy"); _, gzv = self.series("gz")
-            self.cur_gx.setData(tg, gxv); self.cur_gy.setData(tg, gyv); self.cur_gz.setData(tg, gzv)
-            self.plot_gyr.setXRange(x0, x1, padding=0.0)
+            if self.plot_gyr is not None:
+                tg, gxv = self.series("gx"); _, gyv = self.series("gy"); _, gzv = self.series("gz")
+                self.cur_gx.setData(tg, gxv)
+                self.cur_gy.setData(tg, gyv)
+                self.cur_gz.setData(tg, gzv)
+                self.plot_gyr.setXRange(x0, x1, padding=0.0)
 
             # mag
-            tm, mxv = self.series("mx"); _, myv = self.series("my"); _, mzv = self.series("mz")
-            self.cur_mx.setData(tm, mxv); self.cur_my.setData(tm, myv); self.cur_mz.setData(tm, mzv)
-            self.plot_mag.setXRange(x0, x1, padding=0.0)
+            if self.plot_mag is not None:
+                tm, mxv = self.series("mx"); _, myv = self.series("my"); _, mzv = self.series("mz")
+                self.cur_mx.setData(tm, mxv)
+                self.cur_my.setData(tm, myv)
+                self.cur_mz.setData(tm, mzv)
+                self.plot_mag.setXRange(x0, x1, padding=0.0)
 
             # rpy
-            if self.use_vqf:
+            if self.use_vqf and self.plot_rpy is not None:
                 tr, rv = self.series("roll"); _, pv = self.series("pitch"); _, yv = self.series("yaw")
-                self.cur_roll.setData(tr, rv); self.cur_pitch.setData(tr, pv); self.cur_yaw.setData(tr, yv)
+                self.cur_roll.setData(tr, rv)
+                self.cur_pitch.setData(tr, pv)
+                self.cur_yaw.setData(tr, yv)
                 self.plot_rpy.setXRange(x0, x1, padding=0.0)
 
-            tf, fvp = self.series("fpa")
-            self.cur_fpa.setData(tf, fvp)
-            self.plot_fpa.setXRange(x0, x1, padding=0.0)
+            if self.cur_fpa is not None:
+                tf, fvp = self.series("fpa")
+                self.cur_fpa.setData(tf, fvp)
+                self.plot_fpa.setXRange(x0, x1, padding=0.0)
 
             # status
-            self.samples_in_window = len(self.buf["ax"])
+            if self._samples_key is not None and self._samples_key in self.buf:
+                self.samples_in_window = len(self.buf[self._samples_key])
+            else:
+                self.samples_in_window = 0
             status = [
                 f"Window: {self.win:.1f}s",
                 f"samples: ~{self.samples_in_window}",

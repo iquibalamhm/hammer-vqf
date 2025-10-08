@@ -13,6 +13,24 @@ extern "C" {
 
 // --- Foot Progression Angle ---
 #include "FPA.hpp"
+
+#ifndef ENABLE_FPA_DEBUG
+#define ENABLE_FPA_DEBUG 0
+#endif
+
+#ifndef ENABLE_CSV_STREAM
+#define ENABLE_CSV_STREAM 1
+#endif
+
+#if ENABLE_FPA_DEBUG
+#define DEBUG_PRINTLN(x) Serial.println(x)
+#define DEBUG_PRINT(x) Serial.print(x)
+#define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINTLN(x) do {} while (0)
+#define DEBUG_PRINT(x) do {} while (0)
+#define DEBUG_PRINTF(...) do {} while (0)
+#endif
 static FPA g_fpa(/*is_left_foot=*/false); // set to false if this sensor is on the RIGHT foot
 static uint32_t g_lastFeedUs = 0;
 static float g_lastFeedDt = 0.0f;
@@ -86,6 +104,7 @@ bool haveGyrSample = false, haveAccSample = false, haveMagSample = false;
 static uint32_t streamStartUs = 0;
 
 static void printCsvSample(float t_ms) {
+#if ENABLE_CSV_STREAM
   Serial.print(t_ms, 3);      Serial.print(',');
   Serial.print(acc[0], 6);    Serial.print(',');
   Serial.print(acc[1], 6);    Serial.print(',');
@@ -103,6 +122,28 @@ static void printCsvSample(float t_ms) {
     Serial.print("nan");      Serial.print(',');
     Serial.print("nan");
   }
+
+  Serial.print(",footRoll_deg=");
+  if (g_lastFootValid && !isnan(g_lastFootRollDeg)) {
+    Serial.print(g_lastFootRollDeg, 3);
+  } else {
+    Serial.print("nan");
+  }
+  Serial.print(",footPitch_deg=");
+  if (g_lastFootValid && !isnan(g_lastFootPitchDeg)) {
+    Serial.print(g_lastFootPitchDeg, 3);
+  } else {
+    Serial.print("nan");
+  }
+  Serial.print(",footYaw_deg=");
+  if (g_lastFootValid && !isnan(g_lastFootYawDeg)) {
+    Serial.print(g_lastFootYawDeg, 3);
+  } else {
+    Serial.print("nan");
+  }
+#else
+  (void)t_ms;
+#endif
 }
 
 void setup() {
@@ -118,48 +159,50 @@ void setup() {
   Wire.setClock(400000);
   delay(100);
 
-  Serial.println(F("BNO085 + VQF-C (PlatformIO)"));
+  DEBUG_PRINTLN(F("BNO085 + VQF-C (PlatformIO)"));
 
-  // Print a quick I2C scan to help debugging
-  Serial.println(F("I2C scan:"));
-  for (uint8_t addr = 1; addr < 127; ++addr) {
-    Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      Serial.printf(" - Found device at 7-bit 0x%02X\n", addr);
-      delay(5);
+  #if ENABLE_FPA_DEBUG
+    // Print a quick I2C scan to help debugging
+    DEBUG_PRINTLN(F("I2C scan:"));
+    for (uint8_t addr = 1; addr < 127; ++addr) {
+      Wire.beginTransmission(addr);
+      uint8_t err = Wire.endTransmission();
+      if (err == 0) {
+        DEBUG_PRINTF(" - Found device at 7-bit 0x%02X\n", addr);
+        delay(5);
+      }
     }
-  }
+  #endif
 
   // Try to initialize the BNO at the configured address, fall back to 0x28
   uint8_t triedAddrs[2] = { (uint8_t)BNO_ADDR, 0x28 };
   uint8_t usedAddr = 0;
   for (int i = 0; i < 2; ++i) {
     uint8_t a = triedAddrs[i];
-    Serial.printf("Trying BNO init at 0x%02X...\n", a);
+    DEBUG_PRINTF("Trying BNO init at 0x%02X...\n", a);
     if (bno08x.begin_I2C(a, &Wire)) {
       usedAddr = a;
       bnoPresent = true;
-      Serial.printf("BNO08x initialized at 0x%02X\n", a);
+      DEBUG_PRINTF("BNO08x initialized at 0x%02X\n", a);
       break;
     }
     delay(50);
   }
 
   if (!bnoPresent) {
-    Serial.println(F("ERROR: BNO08x not found. Check wiring and I2C address. Proceeding without sensor."));
+    DEBUG_PRINTLN(F("ERROR: BNO08x not found. Check wiring and I2C address. Proceeding without sensor."));
   }
 
   // Enable raw/uncalibrated sensors (perfect for external fusion)
   if (bnoPresent) {
     if (!bno08x.enableReport(SH2_GYROSCOPE_UNCALIBRATED, GYR_US))
-      Serial.println(F("WARN: could not enable uncal gyro"));
+      DEBUG_PRINTLN(F("WARN: could not enable uncal gyro"));
     if (!bno08x.enableReport(SH2_ACCELEROMETER, ACC_US))
-      Serial.println(F("WARN: could not enable accel"));
+      DEBUG_PRINTLN(F("WARN: could not enable accel"));
     if (!bno08x.enableReport(SH2_MAGNETIC_FIELD_UNCALIBRATED, MAG_US))
-      Serial.println(F("WARN: could not enable uncal mag"));
+      DEBUG_PRINTLN(F("WARN: could not enable uncal mag"));
   } else {
-    Serial.println(F("Skipping sensor report enable since BNO not present."));
+    DEBUG_PRINTLN(F("Skipping sensor report enable since BNO not present."));
   }
 
   // Initialize VQF with per-sensor sample times (s)
@@ -179,7 +222,7 @@ void setup() {
   g_lastFootPitchDeg = NAN;
   g_lastFootYawDeg = NAN;
 
-  Serial.println(F("Setup OK. Streaming..."));
+  DEBUG_PRINTLN(F("Setup OK. Streaming..."));
 }
 
 void loop() {
@@ -220,7 +263,6 @@ void loop() {
   if ((haveNewGyr || haveNewAcc) && haveGyrSample && haveAccSample) {
     uint32_t nowUs = micros();
     float t_ms = (nowUs - streamStartUs) * 0.001f;
-    printCsvSample(t_ms);
     haveNewGyr = false;
     haveNewAcc = false;
     // --- Feed FPA estimator once per fused sample ---
@@ -246,7 +288,12 @@ void loop() {
     }
 
     FPA_Result r;
-    if (g_fpa.poll(&r) && r.valid) {
+    bool stridePrinted = false;
+    bool haveResult = g_fpa.poll(&r) && r.valid;
+
+    printCsvSample(t_ms);
+
+    if (haveResult) {
       Serial.printf(",FPA_deg=%.2f,stride=%lu,dx=%.3f,dy=%.3f,Ts=%.3f",
                     r.fpa_deg,
                     static_cast<unsigned long>(r.stride_index),
@@ -258,10 +305,22 @@ void loop() {
       g_lastStrideDuration = r.stride_duration_s;
       g_lastStrideDx = r.delta_xy_m[0];
       g_lastStrideDy = r.delta_xy_m[1];
+      stridePrinted = true;
     }
-    Serial.println();
+
+    bool linePrinted = false;
+    #if ENABLE_CSV_STREAM
+      linePrinted = true;
+    #endif
+    if (stridePrinted) {
+      linePrinted = true;
+    }
+    if (linePrinted) {
+      Serial.println();
+    }
   }
 
+#if ENABLE_FPA_DEBUG
   uint32_t nowMs = millis();
   if (nowMs - g_lastDebugMs > 250) {
     FPA_Debug dbg;
@@ -311,14 +370,15 @@ void loop() {
       g_lastFootYawDeg = dbg.last_foot_yaw_deg;
     }
 
-    Serial.printf(" footDeg(r/p/y)=%.1f/%.1f/%.1f",
-                  g_lastFootValid && !isnan(g_lastFootRollDeg) ? g_lastFootRollDeg : NAN,
-                  g_lastFootValid && !isnan(g_lastFootPitchDeg) ? g_lastFootPitchDeg : NAN,
-                  g_lastFootValid && !isnan(g_lastFootYawDeg) ? g_lastFootYawDeg : NAN);
+  Serial.printf(" footRoll_deg=%.2f,footPitch_deg=%.2f,footYaw_deg=%.2f",
+          g_lastFootValid && !isnan(g_lastFootRollDeg) ? g_lastFootRollDeg : NAN,
+          g_lastFootValid && !isnan(g_lastFootPitchDeg) ? g_lastFootPitchDeg : NAN,
+          g_lastFootValid && !isnan(g_lastFootYawDeg) ? g_lastFootYawDeg : NAN);
 
     Serial.printf(" reject=%d\n", dbg.last_reject_reason);
     g_lastDebugMs = nowMs;
     Serial.println();
 
   }
+#endif
 }
