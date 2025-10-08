@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_BNO08x.h>
+#include <WiFi.h>
 #include <math.h>
+#include <strings.h>
 
 // I2C address for BNO085/BNO08x (default is usually 0x4A). Define it here
 // if your board uses a different address.
@@ -20,6 +22,30 @@ extern "C" {
 
 #ifndef ENABLE_CSV_STREAM
 #define ENABLE_CSV_STREAM 1
+#endif
+
+#ifndef ENABLE_TCP_STREAM
+#define ENABLE_TCP_STREAM 1
+#endif
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "GL-SFT1200-0ce"
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "goodlife"
+#endif
+
+#ifndef TCP_SERVER_IP
+#define TCP_SERVER_IP "192.168.8.158"
+#endif
+
+#ifndef TCP_SERVER_PORT
+#define TCP_SERVER_PORT 12345
+#endif
+
+#ifndef STATUS_LED_PIN
+#define STATUS_LED_PIN 13
 #endif
 
 #if ENABLE_FPA_DEBUG
@@ -45,6 +71,17 @@ static bool g_lastFootValid = false;
 static float g_lastFootRollDeg = NAN;
 static float g_lastFootPitchDeg = NAN;
 static float g_lastFootYawDeg = NAN;
+static float g_zeroRollDeg = 0.0f;
+static float g_zeroPitchDeg = 0.0f;
+static float g_zeroYawDeg = 0.0f;
+
+static bool g_wifiConnected = false;
+static bool g_tcpConnected = false;
+static WiFiClient g_tcpClient;
+static unsigned long g_lastWifiAttemptMs = 0;
+static unsigned long g_lastTcpAttemptMs = 0;
+static char g_tcpCmdBuf[32];
+static size_t g_tcpCmdLen = 0;
 
 static void quatToEulerDeg(const float q[4], float* outRollDeg, float* outPitchDeg, float* outYawDeg) {
   // q = (w, x, y, z)
@@ -68,6 +105,159 @@ static void quatToEulerDeg(const float q[4], float* outRollDeg, float* outPitchD
   if (outRollDeg) *outRollDeg = roll * RAD2DEG;
   if (outPitchDeg) *outPitchDeg = pitch * RAD2DEG;
   if (outYawDeg) *outYawDeg = yaw * RAD2DEG;
+}
+
+static float wrapAngleDeg(float deg) {
+  while (deg > 180.0f) deg -= 360.0f;
+  while (deg < -180.0f) deg += 360.0f;
+  return deg;
+}
+
+static void setStatusLed(bool on) {
+  digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
+}
+
+static bool getZeroedOrientation(float* outRollDeg, float* outPitchDeg, float* outYawDeg) {
+  if (!g_lastFootValid || isnan(g_lastFootRollDeg) || isnan(g_lastFootPitchDeg) || isnan(g_lastFootYawDeg)) {
+    if (outRollDeg) *outRollDeg = NAN;
+    if (outPitchDeg) *outPitchDeg = NAN;
+    if (outYawDeg) *outYawDeg = NAN;
+    return false;
+  }
+  float roll = wrapAngleDeg(g_lastFootRollDeg - g_zeroRollDeg);
+  float pitch = wrapAngleDeg(g_lastFootPitchDeg - g_zeroPitchDeg);
+  float yaw = wrapAngleDeg(g_lastFootYawDeg - g_zeroYawDeg);
+  if (outRollDeg) *outRollDeg = roll;
+  if (outPitchDeg) *outPitchDeg = pitch;
+  if (outYawDeg) *outYawDeg = yaw;
+  return true;
+}
+
+static void zeroFootOrientation() {
+  if (!g_lastFootValid) {
+    DEBUG_PRINTLN(F("ZE command ignored: orientation invalid"));
+    return;
+  }
+  g_zeroRollDeg = g_lastFootRollDeg;
+  g_zeroPitchDeg = g_lastFootPitchDeg;
+  g_zeroYawDeg = g_lastFootYawDeg;
+  DEBUG_PRINTLN(F("Foot orientation zeroed"));
+}
+
+static void handleTcpCommand(const char* cmd) {
+  if (!cmd || !cmd[0]) {
+    return;
+  }
+  if (strcasecmp(cmd, "ze") == 0) {
+    zeroFootOrientation();
+    setStatusLed(true);
+    delay(50);
+    setStatusLed(g_tcpConnected);
+#if ENABLE_TCP_STREAM
+    if (g_tcpClient.connected()) {
+      g_tcpClient.println(F("ACK ZE"));
+    }
+#endif
+  } else {
+    DEBUG_PRINT(F("Unknown TCP cmd: "));
+    DEBUG_PRINTLN(cmd);
+  }
+}
+
+static void pollTcpCommands() {
+#if ENABLE_TCP_STREAM
+  if (!g_tcpClient.connected()) {
+    g_tcpCmdLen = 0;
+    return;
+  }
+  while (g_tcpClient.available()) {
+    int c = g_tcpClient.read();
+    if (c < 0) {
+      break;
+    }
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      if (g_tcpCmdLen > 0) {
+        g_tcpCmdBuf[g_tcpCmdLen] = '\0';
+        handleTcpCommand(g_tcpCmdBuf);
+        g_tcpCmdLen = 0;
+      }
+      continue;
+    }
+    if (g_tcpCmdLen + 1 < sizeof(g_tcpCmdBuf)) {
+      g_tcpCmdBuf[g_tcpCmdLen++] = static_cast<char>(c);
+    } else {
+      g_tcpCmdLen = 0; // overflow, reset buffer
+    }
+  }
+#endif
+}
+
+static void sendTcpTelemetry(float rollDeg, float pitchDeg, float yawDeg) {
+#if ENABLE_TCP_STREAM
+  if (!g_tcpClient.connected()) {
+    return;
+  }
+  char line[128];
+  int n = snprintf(line, sizeof(line),
+                   "footRoll_deg=%.3f,footPitch_deg=%.3f,footYaw_deg=%.3f\n",
+                   rollDeg, pitchDeg, yawDeg);
+  if (n > 0) {
+    g_tcpClient.write(reinterpret_cast<const uint8_t*>(line), static_cast<size_t>(n));
+  }
+#else
+  (void)rollDeg;
+  (void)pitchDeg;
+  (void)yawDeg;
+#endif
+}
+
+static void attemptTcpConnect();
+
+static void maintainNetwork() {
+#if ENABLE_TCP_STREAM
+  bool wifiNow = (WiFi.status() == WL_CONNECTED);
+  if (!wifiNow && (millis() - g_lastWifiAttemptMs) > 5000UL) {
+    g_lastWifiAttemptMs = millis();
+    WiFi.disconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+  if (wifiNow != g_wifiConnected) {
+    g_wifiConnected = wifiNow;
+  }
+
+  if (g_wifiConnected) {
+    if (!g_tcpClient.connected() && (millis() - g_lastTcpAttemptMs) > 2000UL) {
+      attemptTcpConnect();
+    }
+  } else {
+    if (g_tcpClient.connected()) {
+      g_tcpClient.stop();
+    }
+  }
+
+  bool tcpNow = g_tcpClient.connected();
+  if (tcpNow != g_tcpConnected) {
+    g_tcpConnected = tcpNow;
+  }
+  setStatusLed(g_tcpConnected);
+#endif
+}
+
+static void attemptTcpConnect() {
+#if ENABLE_TCP_STREAM
+  g_lastTcpAttemptMs = millis();
+  g_tcpClient.stop();
+  if (g_tcpClient.connect(TCP_SERVER_IP, TCP_SERVER_PORT)) {
+    g_tcpConnected = true;
+    DEBUG_PRINTLN(F("TCP connected"));
+  } else {
+    g_tcpConnected = false;
+    DEBUG_PRINTLN(F("TCP connect failed"));
+  }
+#endif
 }
 
 // ====== IMU + VQF config ======
@@ -123,21 +313,23 @@ static void printCsvSample(float t_ms) {
     Serial.print("nan");
   }
 
+  float rollZero = NAN, pitchZero = NAN, yawZero = NAN;
+  bool haveZero = getZeroedOrientation(&rollZero, &pitchZero, &yawZero);
   Serial.print(",footRoll_deg=");
-  if (g_lastFootValid && !isnan(g_lastFootRollDeg)) {
-    Serial.print(g_lastFootRollDeg, 3);
+  if (haveZero && !isnan(rollZero)) {
+    Serial.print(rollZero, 3);
   } else {
     Serial.print("nan");
   }
   Serial.print(",footPitch_deg=");
-  if (g_lastFootValid && !isnan(g_lastFootPitchDeg)) {
-    Serial.print(g_lastFootPitchDeg, 3);
+  if (haveZero && !isnan(pitchZero)) {
+    Serial.print(pitchZero, 3);
   } else {
     Serial.print("nan");
   }
   Serial.print(",footYaw_deg=");
-  if (g_lastFootValid && !isnan(g_lastFootYawDeg)) {
-    Serial.print(g_lastFootYawDeg, 3);
+  if (haveZero && !isnan(yawZero)) {
+    Serial.print(yawZero, 3);
   } else {
     Serial.print("nan");
   }
@@ -158,6 +350,26 @@ void setup() {
   #endif
   Wire.setClock(400000);
   delay(100);
+
+#if ENABLE_TCP_STREAM
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  setStatusLed(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < 10000UL) {
+    delay(100);
+  }
+  g_wifiConnected = (WiFi.status() == WL_CONNECTED);
+  g_lastWifiAttemptMs = millis();
+  if (g_wifiConnected) {
+    attemptTcpConnect();
+  }
+  setStatusLed(g_wifiConnected && g_tcpClient.connected());
+#else
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  setStatusLed(false);
+#endif
 
   DEBUG_PRINTLN(F("BNO085 + VQF-C (PlatformIO)"));
 
@@ -226,6 +438,9 @@ void setup() {
 }
 
 void loop() {
+  maintainNetwork();
+  pollTcpCommands();
+
   sh2_SensorValue_t evt;
   while (bno08x.getSensorEvent(&evt)) {
     switch (evt.sensorId) {
@@ -291,7 +506,14 @@ void loop() {
     bool stridePrinted = false;
     bool haveResult = g_fpa.poll(&r) && r.valid;
 
+    float rollZero = NAN, pitchZero = NAN, yawZero = NAN;
+    bool haveZeroOrientation = getZeroedOrientation(&rollZero, &pitchZero, &yawZero);
+
     printCsvSample(t_ms);
+
+    if (haveZeroOrientation) {
+      sendTcpTelemetry(rollZero, pitchZero, yawZero);
+    }
 
     if (haveResult) {
       Serial.printf(",FPA_deg=%.2f,stride=%lu,dx=%.3f,dy=%.3f,Ts=%.3f",
