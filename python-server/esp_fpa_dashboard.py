@@ -22,6 +22,13 @@ Protocol to the ESP32:
       fpa.offset_deg=FLOAT    -> static offset added to FPA
       fpa.median_win=INT      -> median filter window (samples)
       fpa.lowpass_hz=FLOAT    -> one‑pole LPF cutoff (Hz)
+    vqf.tau_acc=FLOAT       -> accelerometer fusion time constant (s)
+    vqf.tau_mag=FLOAT       -> magnetometer fusion time constant (s)
+    vqf.motion_bias=0|1     -> enable motion bias estimator
+    vqf.rest_bias=0|1       -> enable rest bias estimator
+    vqf.mag_reject=0|1      -> enable mag disturbance rejection
+    vqf.use_mag=0|1         -> feed magnetometer to VQF
+    vqf.reset               -> reinitialize VQF state
 You can rename/tweak keys if you prefer; just mirror on firmware.
 """
 import argparse
@@ -43,6 +50,11 @@ FOOT_RE = re.compile(
     re.IGNORECASE,
 )
 FPA_RE = re.compile(r"fpa_deg=([-+]?\d*\.?\d+)", re.IGNORECASE)
+QUAT_RE = re.compile(
+    r"quat_w=([-+]?\d*\.?\d+),quat_x=([-+]?\d*\.?\d+),"
+    r"quat_y=([-+]?\d*\.?\d+),quat_z=([-+]?\d*\.?\d+)",
+    re.IGNORECASE,
+)
 
 
 def _to_float(tok: str) -> float:
@@ -59,6 +71,7 @@ class SharedState:
         self.last_seen = 0.0
         self.foot_rpy = [float("nan")] * 3
         self.fpa_deg = float("nan")
+        self.quat = [float("nan")] * 4
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -74,6 +87,10 @@ class SharedState:
                 "foot_pitch_deg": safe_float(self.foot_rpy[1]),
                 "foot_yaw_deg": safe_float(self.foot_rpy[2]),
                 "fpa_deg": safe_float(self.fpa_deg),
+                "quat_w": safe_float(self.quat[0]),
+                "quat_x": safe_float(self.quat[1]),
+                "quat_y": safe_float(self.quat[2]),
+                "quat_z": safe_float(self.quat[3]),
             }
 
 
@@ -122,6 +139,14 @@ class TcpBridge(threading.Thread):
                 f = float("nan")
             with self.state.lock:
                 self.state.fpa_deg = f
+                self.state.last_seen = now
+            return
+        m3 = QUAT_RE.search(txt)
+        if m3:
+            vals = [_to_float(t) for t in m3.groups()]
+            with self.state.lock:
+                for i in range(4):
+                    self.state.quat[i] = vals[i]
                 self.state.last_seen = now
             return
         if self.verbose:
@@ -237,6 +262,28 @@ def make_app(bridge: TcpBridge, state: SharedState) -> FastAPI:
                 sent[k] = bool(ok)
         return JSONResponse({"sent": sent})
 
+    @app.post("/api/vqf")
+    async def api_vqf(request: Request) -> JSONResponse:
+        try:
+            params = await request.json()
+        except Exception:
+            params = {}
+        sent = {}
+        mapping = {
+            "tau_acc": "vqf.tau_acc",
+            "tau_mag": "vqf.tau_mag",
+            "motion_bias": "vqf.motion_bias",
+            "rest_bias": "vqf.rest_bias",
+            "mag_reject": "vqf.mag_reject",
+            "use_mag": "vqf.use_mag",
+        }
+        for k, v in params.items():
+            if k in mapping:
+                line = f"{mapping[k]}={v}"
+                ok = bridge.send_line(line)
+                sent[k] = bool(ok)
+        return JSONResponse({"sent": sent})
+
     @app.post("/api/fpa/core")
     async def api_fpa_core(request: Request) -> JSONResponse:
         """Configure core FPA detection thresholds."""
@@ -308,6 +355,21 @@ HTML_PAGE = r"""
     </div>
   </div>
 
+    <div class="card" style="margin-top:12px">
+        <h2>Foot Orientation</h2>
+        <div class="grid" style="grid-template-columns: repeat(auto-fill,minmax(120px,1fr));">
+            <div><label>Roll (deg)</label><div class="metric" style="font-size:1.4rem"><span id="roll">—</span></div></div>
+            <div><label>Pitch (deg)</label><div class="metric" style="font-size:1.4rem"><span id="pitch">—</span></div></div>
+            <div><label>Yaw (deg)</label><div class="metric" style="font-size:1.4rem"><span id="yaw">—</span></div></div>
+        </div>
+        <div class="grid" style="margin-top:12px; grid-template-columns: repeat(auto-fill,minmax(150px,1fr));">
+            <div><label>q<sub>w</sub></label><div class="muted" id="quat_w">—</div></div>
+            <div><label>q<sub>x</sub></label><div class="muted" id="quat_x">—</div></div>
+            <div><label>q<sub>y</sub></label><div class="muted" id="quat_y">—</div></div>
+            <div><label>q<sub>z</sub></label><div class="muted" id="quat_z">—</div></div>
+        </div>
+    </div>
+
   <div class="card" style="margin-top:12px">
     <h2>FPA Post-Processing</h2>
     <div class="grid">
@@ -339,11 +401,32 @@ HTML_PAGE = r"""
     </div>
   </div>
 
+    <div class="card" style="margin-top:12px">
+        <h2>VQF Fusion</h2>
+        <p class="muted" style="margin-bottom:12px">Tune the orientation filter if you notice drift or jitter.</p>
+        <div class="grid">
+            <div><label>Tau<sub>acc</sub> (s)</label><input id="tau_acc" type="number" step="0.5" placeholder="3.0"></div>
+            <div><label>Tau<sub>mag</sub> (s)</label><input id="tau_mag" type="number" step="0.5" placeholder="9.0"></div>
+        </div>
+            <div class="grid" style="margin-top:12px; grid-template-columns: repeat(auto-fill,minmax(150px,1fr));">
+                <label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="motion_bias" checked>Motion bias estimator</label>
+                <label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="rest_bias" checked>Rest bias estimator</label>
+                <label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="mag_reject" checked>Mag disturbance reject</label>
+                <label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="use_mag" checked>Use magnetometer</label>
+        </div>
+        <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="primary" id="applyVqf">Apply VQF Settings</button>
+            <button id="resetVqf">Reset VQF</button>
+            <button id="vqfDefaults">Defaults</button>
+        </div>
+    </div>
+
   <div class="footer">Open this page on your phone while your laptop runs the server on the same Wi‑Fi.</div>
 </div>
 
 <script>
 const fmt = v => (v===null || v===undefined || Number.isNaN(v)) ? "—" : (+v).toFixed(2);
+const fmtQuat = v => (v===null || v===undefined || Number.isNaN(v)) ? "—" : (+v).toFixed(4);
 const fpaHistory = [];
 const plot = document.getElementById('plot');
 const ctx = plot.getContext('2d');
@@ -376,6 +459,13 @@ async function poll() {
     document.getElementById('conn').className = 'badge ' + (s.connected ? 'ok':'bad');
     document.getElementById('fpa').textContent = fmt(s.fpa_deg);
     document.getElementById('age').textContent = 'Last update: ' + (s.last_seen_s_ago==null? '—' : s.last_seen_s_ago.toFixed(1)+'s ago');
+        document.getElementById('roll').textContent = fmt(s.foot_roll_deg);
+        document.getElementById('pitch').textContent = fmt(s.foot_pitch_deg);
+        document.getElementById('yaw').textContent = fmt(s.foot_yaw_deg);
+        document.getElementById('quat_w').textContent = fmtQuat(s.quat_w);
+        document.getElementById('quat_x').textContent = fmtQuat(s.quat_x);
+        document.getElementById('quat_y').textContent = fmtQuat(s.quat_y);
+        document.getElementById('quat_z').textContent = fmtQuat(s.quat_z);
     if (!Number.isNaN(+s.fpa_deg)){
       fpaHistory.push(+s.fpa_deg);
       if (fpaHistory.length>200) fpaHistory.shift();
@@ -393,6 +483,9 @@ async function sendFpa(params){
 }
 async function sendFpaCore(params){
   await fetch('/api/fpa/core', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(params)});
+}
+async function sendVqf(params){
+    await fetch('/api/vqf', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(params)});
 }
 
 document.getElementById('btnZero').onclick = ()=> sendCmd({action:'reset_bno'});
@@ -427,6 +520,40 @@ document.getElementById('disableFilters').onclick = ()=>{
     median_win: 1,
     lowpass_hz: 0.0
   });
+};
+
+document.getElementById('applyVqf').onclick = ()=>{
+    const payload = {};
+    const tauA = document.getElementById('tau_acc').value;
+    const tauM = document.getElementById('tau_mag').value;
+    if (tauA!=='') payload.tau_acc = +tauA;
+    if (tauM!=='') payload.tau_mag = +tauM;
+    payload.motion_bias = document.getElementById('motion_bias').checked ? 1 : 0;
+    payload.rest_bias = document.getElementById('rest_bias').checked ? 1 : 0;
+    payload.mag_reject = document.getElementById('mag_reject').checked ? 1 : 0;
+        payload.use_mag = document.getElementById('use_mag').checked ? 1 : 0;
+    sendVqf(payload);
+};
+
+document.getElementById('vqfDefaults').onclick = ()=>{
+    document.getElementById('tau_acc').value = '3.0';
+    document.getElementById('tau_mag').value = '9.0';
+    document.getElementById('motion_bias').checked = true;
+    document.getElementById('rest_bias').checked = true;
+    document.getElementById('mag_reject').checked = true;
+        document.getElementById('use_mag').checked = true;
+    sendVqf({
+        tau_acc: 3.0,
+        tau_mag: 9.0,
+        motion_bias: 1,
+        rest_bias: 1,
+            mag_reject: 1,
+            use_mag: 1
+    });
+};
+
+document.getElementById('resetVqf').onclick = ()=>{
+    sendCmd({raw:'vqf.reset'});
 };
 
 document.getElementById('applyCore').onclick = ()=>{

@@ -10,6 +10,8 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+
 #ifdef VQF_SINGLE_PRECISION
 typedef float vqf_real_t;
 typedef float vqf_double_t;
@@ -30,6 +32,14 @@ void getQuat9D(vqf_real_t out[4]);
 vqf_real_t getDelta();
 vqf_real_t getBiasEstimate(vqf_real_t out[3]);
 void initVqf(vqf_real_t gyrTs, vqf_real_t accTs, vqf_real_t magTs);
+
+void setTauAcc(vqf_real_t tauAcc);
+void setTauMag(vqf_real_t tauMag);
+void setMotionBiasEstEnabled(bool enabled);
+void setRestBiasEstEnabled(bool enabled);
+void setMagDistRejectionEnabled(bool enabled);
+void setRestDetectionThresholds(vqf_real_t thGyr, vqf_real_t thAcc);
+void resetState();
 
 #ifdef __cplusplus
 }

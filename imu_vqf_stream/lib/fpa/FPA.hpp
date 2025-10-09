@@ -359,8 +359,11 @@ void FPA::maybe_finalize_trest_() {
     // When a NEW t_rest appears, finalize the previous stride [t_rest_prev, t_rest_curr]
     // The first t_rest only sets the stride start index
     if (stride_idx_ == 0) {
-      // mark integration start index (first sample at/after trest)
-      idx_stride_begin_ = n_;
+      // First stride: drop any pre-run samples (often idle) to avoid index overflow
+      n_ = 0;
+      idx_stride_begin_ = 0;
+      grav_accum_[0] = grav_accum_[1] = grav_accum_[2] = 0.0f;
+      grav_count_ = 0;
     } else {
       // integrate previous stride
       integrate_and_compute_();

@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <math.h>
 #include <strings.h>
+#include <string.h>
 
 // I2C multiplexer (PCA9548A)
 #define PCA9548A_ADDRESS 0x70
@@ -20,15 +21,15 @@ extern "C" {
 #include "FPA.hpp"
 
 #ifndef ENABLE_FPA_DEBUG
-#define ENABLE_FPA_DEBUG 1
+#define ENABLE_FPA_DEBUG 0
 #endif
 
 #ifndef ENABLE_CSV_STREAM
-#define ENABLE_CSV_STREAM 0
+#define ENABLE_CSV_STREAM 1
 #endif
 
 #ifndef ENABLE_TCP_STREAM
-#define ENABLE_TCP_STREAM 1
+#define ENABLE_TCP_STREAM 0
 #endif
 
 #ifndef WIFI_SSID
@@ -91,9 +92,9 @@ static float g_zeroPitchDeg = 0.0f;
 static float g_zeroYawDeg = 0.0f;
 
 // ====== FPA Detection Thresholds (used by configure() calls) ======
-static const float FPA_ACC_DIFF_TH = 0.35f;  // moderate sensitivity
+static const float FPA_ACC_DIFF_TH = 0.455f;  // moderate sensitivity
 static const float FPA_GYR_NORM_TH = 1.0f;   // ~57 deg/s
-static const float FPA_HYS_FRAC = 0.25f;     // 25% hysteresis
+static const float FPA_HYS_FRAC = 0.15f;     // 25% hysteresis
 static const float FPA_MIN_REST_S = 0.08f;   // 80ms min rest
 static const float FPA_MIN_MOTION_S = 0.06f; // 60ms min motion
 
@@ -107,6 +108,24 @@ static const int FPA_MED_MAX = 101;
 static float g_fpa_med_buf[FPA_MED_MAX];
 static int   g_fpa_med_n = 0;
 static int   g_fpa_med_idx = 0;
+
+static void requestMagReport(bool enable);
+
+extern Adafruit_BNO08x bno08x;
+extern bool bnoPresent;
+extern bool haveMagSample;
+
+// ---- VQF tuning ----
+static float g_vqf_tau_acc = 3.0f;   // s
+static float g_vqf_tau_mag = 9.0f;   // s
+static bool  g_vqf_motion_bias = true;
+static bool  g_vqf_rest_bias = true;
+static bool  g_vqf_mag_reject = true;
+static bool  g_vqf_use_mag = false;
+
+static bool  g_haveQuat = false;
+static float g_lastQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+static uint32_t g_lastQuatSendMs = 0;
 
 static inline void fpaFiltersReset() {
   g_fpa_lpf_y = NAN;
@@ -261,6 +280,13 @@ static void handleTcpCommand(const char* cmd) {
     return;
   }
 
+  if (strcasecmp(cmd, "vqf.reset") == 0) {
+    resetState();
+    g_haveQuat = false;
+    if (g_tcpClient.connected()) g_tcpClient.println(F("ACK vqf.reset"));
+    return;
+  }
+
   // key=value
   const char* eq = strchr(cmd, '=');
   if (eq && eq>cmd) {
@@ -275,6 +301,47 @@ static void handleTcpCommand(const char* cmd) {
     if (key == "fpa.offset_deg") { g_fpa_offset_deg = f; did = true; }
     else if (key == "fpa.median_win") { g_fpa_median_win = (int)max(1L, min(101L, li)); fpaFiltersReset(); did = true; }
     else if (key == "fpa.lowpass_hz") { g_fpa_lowpass_hz = f; fpaFiltersReset(); did = true; }
+
+    else if (key == "vqf.tau_acc") {
+      g_vqf_tau_acc = f > 0.0f ? f : g_vqf_tau_acc;
+      setTauAcc(g_vqf_tau_acc);
+      did = true;
+    }
+    else if (key == "vqf.tau_mag") {
+      g_vqf_tau_mag = f > 0.0f ? f : g_vqf_tau_mag;
+      setTauMag(g_vqf_tau_mag);
+      did = true;
+    }
+    else if (key == "vqf.motion_bias") {
+      g_vqf_motion_bias = (li != 0);
+      setMotionBiasEstEnabled(g_vqf_motion_bias);
+      did = true;
+    }
+    else if (key == "vqf.rest_bias") {
+      g_vqf_rest_bias = (li != 0);
+      setRestBiasEstEnabled(g_vqf_rest_bias);
+      did = true;
+    }
+    else if (key == "vqf.mag_reject") {
+      g_vqf_mag_reject = (li != 0);
+      setMagDistRejectionEnabled(g_vqf_mag_reject);
+      did = true;
+    }
+    else if (key == "vqf.use_mag") {
+      bool newUse = (li != 0);
+      if (g_vqf_use_mag != newUse) {
+        g_vqf_use_mag = newUse;
+        if (g_vqf_use_mag) {
+          setTauMag(g_vqf_tau_mag);
+          setMagDistRejectionEnabled(g_vqf_mag_reject);
+          requestMagReport(true);
+        } else {
+          setMagDistRejectionEnabled(false);
+          requestMagReport(false);
+        }
+      }
+      did = true;
+    }
 
     // Advanced: direct FPA core tuning (optional)
     else if (key == "fpa.cfg.acc_diff_th" || key == "fpa.acc_diff_th") { 
@@ -376,6 +443,22 @@ static void sendTcpFpa(float fpaDeg) {
 #endif
 }
 
+static void sendTcpQuat(const float q[4]) {
+#if ENABLE_TCP_STREAM
+  if (!g_tcpClient.connected()) {
+    return;
+  }
+  char line[96];
+  int n = snprintf(line, sizeof(line), "quat_w=%.6f,quat_x=%.6f,quat_y=%.6f,quat_z=%.6f\n",
+                   q[0], q[1], q[2], q[3]);
+  if (n > 0) {
+    g_tcpClient.write(reinterpret_cast<const uint8_t*>(line), static_cast<size_t>(n));
+  }
+#else
+  (void)q;
+#endif
+}
+
 static void attemptTcpConnect();
 
 static void maintainNetwork() {
@@ -434,6 +517,18 @@ static const uint32_t MAG_US = (uint32_t)(1e6f / MAG_HZ);
 static const float GYR_DT = 1.0f / GYR_HZ;
 static const float ACC_DT = 1.0f / ACC_HZ;
 static const float MAG_DT = 1.0f / MAG_HZ;
+
+static void requestMagReport(bool enable) {
+  if (!bnoPresent) return;
+  selectMultiplexerChannel(0);
+  if (enable) {
+    if (!bno08x.enableReport(SH2_MAGNETIC_FIELD_UNCALIBRATED, MAG_US)) {
+      DEBUG_PRINTLN(F("WARN: could not enable uncal mag"));
+    }
+  } else {
+    haveMagSample = false;
+  }
+}
 
 // Optional: override I2C pins if your wiring needs it.
 // #define I2C_SDA 21
@@ -572,14 +667,21 @@ void setup() {
       DEBUG_PRINTLN(F("WARN: could not enable uncal gyro"));
     if (!bno08x.enableReport(SH2_ACCELEROMETER, ACC_US))
       DEBUG_PRINTLN(F("WARN: could not enable accel"));
-    if (!bno08x.enableReport(SH2_MAGNETIC_FIELD_UNCALIBRATED, MAG_US))
-      DEBUG_PRINTLN(F("WARN: could not enable uncal mag"));
+    if (g_vqf_use_mag) {
+      if (!bno08x.enableReport(SH2_MAGNETIC_FIELD_UNCALIBRATED, MAG_US))
+        DEBUG_PRINTLN(F("WARN: could not enable uncal mag"));
+    }
   } else {
     DEBUG_PRINTLN(F("Skipping sensor report enable since BNO not present."));
   }
 
   // Initialize VQF with per-sensor sample times (s)
   initVqf(GYR_DT, ACC_DT, MAG_DT);
+  setTauAcc(g_vqf_tau_acc);
+  setTauMag(g_vqf_tau_mag);
+  setMotionBiasEstEnabled(g_vqf_motion_bias);
+  setRestBiasEstEnabled(g_vqf_rest_bias);
+  setMagDistRejectionEnabled(g_vqf_use_mag ? g_vqf_mag_reject : false);
 
   streamStartUs = micros();
   g_lastFeedUs = 0;
@@ -628,11 +730,13 @@ void loop() {
 
       case SH2_MAGNETIC_FIELD_UNCALIBRATED:
         // microtesla
-        mag[0] = evt.un.magneticField.x;
-        mag[1] = evt.un.magneticField.y;
-        mag[2] = evt.un.magneticField.z;
-        updateMag(mag);
-        haveMagSample = true;
+        if (g_vqf_use_mag) {
+          mag[0] = evt.un.magneticField.x;
+          mag[1] = evt.un.magneticField.y;
+          mag[2] = evt.un.magneticField.z;
+          updateMag(mag);
+          haveMagSample = true;
+        }
         break;
     }
   }
@@ -660,6 +764,8 @@ void loop() {
       float gyr_f[3] = { static_cast<float>(gyr[0]), static_cast<float>(gyr[1]), static_cast<float>(gyr[2]) };
       quatToEulerDeg(q, &g_lastFootRollDeg, &g_lastFootPitchDeg, &g_lastFootYawDeg);
       g_lastFootValid = true;
+      memcpy(g_lastQuat, q, sizeof(g_lastQuat));
+      g_haveQuat = true;
       g_fpa.feed(acc_f, gyr_f, q, dt);
       g_lastFeedAccepted = true;
     }
@@ -675,6 +781,14 @@ void loop() {
 
     if (haveZeroOrientation) {
       sendTcpTelemetry(rollZero, pitchZero, yawZero);
+    }
+
+    if (g_haveQuat) {
+      uint32_t nowMsQuat = millis();
+      if (nowMsQuat - g_lastQuatSendMs > 40) {
+        sendTcpQuat(g_lastQuat);
+        g_lastQuatSendMs = nowMsQuat;
+      }
     }
 
     if (haveResult) {
@@ -776,6 +890,10 @@ void loop() {
           g_lastFootValid && !isnan(g_lastFootRollDeg) ? g_lastFootRollDeg : NAN,
           g_lastFootValid && !isnan(g_lastFootPitchDeg) ? g_lastFootPitchDeg : NAN,
           g_lastFootValid && !isnan(g_lastFootYawDeg) ? g_lastFootYawDeg : NAN);
+
+    if (g_haveQuat) {
+      Serial.printf(" quat=[%.5f,%.5f,%.5f,%.5f]", g_lastQuat[0], g_lastQuat[1], g_lastQuat[2], g_lastQuat[3]);
+    }
 
     Serial.printf(" reject=%d\n", dbg.last_reject_reason);
     g_lastDebugMs = nowMs;
