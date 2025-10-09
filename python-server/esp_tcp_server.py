@@ -126,7 +126,7 @@ class TcpBridge:
             roll_str = f"{roll:6.2f}" if roll == roll else "  nan"
             pitch_str = f"{pitch:6.2f}" if pitch == pitch else "  nan"
             yaw_str = f"{yaw:6.2f}" if yaw == yaw else "  nan"
-            print(f"📡 foot r/p/y = {roll_str} / {pitch_str} / {yaw_str} deg")
+            # print(f"📡 foot r/p/y = {roll_str} / {pitch_str} / {yaw_str} deg")
         else:
             fpa = FPA_RE.search(txt)
             if fpa:

@@ -258,6 +258,21 @@ static void sendTcpTelemetry(float rollDeg, float pitchDeg, float yawDeg) {
 #endif
 }
 
+static void sendTcpFpa(float fpaDeg) {
+#if ENABLE_TCP_STREAM
+  if (!g_tcpClient.connected()) {
+    return;
+  }
+  char line[64];
+  int n = snprintf(line, sizeof(line), "fpa_deg=%.3f\n", fpaDeg);
+  if (n > 0) {
+    g_tcpClient.write(reinterpret_cast<const uint8_t*>(line), static_cast<size_t>(n));
+  }
+#else
+  (void)fpaDeg;
+#endif
+}
+
 static void attemptTcpConnect();
 
 static void maintainNetwork() {
@@ -317,11 +332,14 @@ static const float GYR_DT = 1.0f / GYR_HZ;
 static const float ACC_DT = 1.0f / ACC_HZ;
 static const float MAG_DT = 1.0f / MAG_HZ;
 
-static const float FPA_ACC_DIFF_TH = 0.25f;
-static const float FPA_GYR_NORM_TH = 0.7f;
-static const float FPA_HYS_FRAC = 0.2f;
-static const float FPA_MIN_REST_S = 0.05f;
-static const float FPA_MIN_MOTION_S = 0.05f;
+// Balanced thresholds for reliable stride detection without false positives
+// acc_diff: how much |a| can deviate from 9.81 m/s^2 during rest
+// gyr_norm: max gyro magnitude during rest in rad/s
+static const float FPA_ACC_DIFF_TH = 0.35f;  // moderate sensitivity (was 0.25 → 0.5)
+static const float FPA_GYR_NORM_TH = 1.0f;   // ~57 deg/s (was 0.7 → 1.5)
+static const float FPA_HYS_FRAC = 0.25f;     // 25% hysteresis (was 0.2 → 0.3)
+static const float FPA_MIN_REST_S = 0.08f;   // 80ms min rest (was 0.05 → 0.15)
+static const float FPA_MIN_MOTION_S = 0.06f; // 60ms min motion (was 0.05 → 0.10)
 
 // Optional: override I2C pins if your wiring needs it.
 // #define I2C_SDA 21
@@ -566,18 +584,29 @@ void loop() {
     }
 
     if (haveResult) {
-      Serial.printf(",FPA_deg=%.2f,stride=%lu,dx=%.3f,dy=%.3f,Ts=%.3f",
+      // Relaxed validation: accept most strides, filter only extreme outliers
+      bool validStride = (r.stride_duration_s >= 0.2f && r.stride_duration_s <= 3.0f);
+      float displacement = sqrtf(r.delta_xy_m[0]*r.delta_xy_m[0] + r.delta_xy_m[1]*r.delta_xy_m[1]);
+      validStride = validStride && (displacement >= 0.02f && displacement <= 3.0f);
+      
+      Serial.printf(",FPA_deg=%.2f,valid=%d,stride=%lu,dx=%.3f,dy=%.3f,Ts=%.3f",
                     r.fpa_deg,
+                    validStride ? 1 : 0,
                     static_cast<unsigned long>(r.stride_index),
                     r.delta_xy_m[0],
                     r.delta_xy_m[1],
                     r.stride_duration_s);
       g_lastStridePrinted = r.stride_index;
-      g_lastFpaDeg = r.fpa_deg;
+      g_lastFpaDeg = r.fpa_deg;  // store raw value
       g_lastStrideDuration = r.stride_duration_s;
       g_lastStrideDx = r.delta_xy_m[0];
       g_lastStrideDy = r.delta_xy_m[1];
       stridePrinted = true;
+      
+      // Send raw FPA over TCP
+      if (validStride) {
+        sendTcpFpa(r.fpa_deg);
+      }
     }
 
     bool linePrinted = false;
