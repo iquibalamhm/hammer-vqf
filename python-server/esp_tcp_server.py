@@ -187,7 +187,7 @@ class TcpBridge:
                     self.conn = conn
                 print(f"✅ connected: {addr}")
 
-                command_thread = threading.Thread(target=self._command_loop, daemon=True)
+                command_thread = threading.Thread(target=self._command_lgoop, daemon=True)
                 telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
                 command_thread.start()
                 telemetry_thread.start()

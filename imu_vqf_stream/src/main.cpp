@@ -5,6 +5,9 @@
 #include <math.h>
 #include <strings.h>
 
+// I2C multiplexer (PCA9548A)
+#define PCA9548A_ADDRESS 0x70
+
 // I2C address for BNO085/BNO08x (default is usually 0x4A). Define it here
 // if your board uses a different address.
 #define BNO_ADDR 0x4A
@@ -37,15 +40,27 @@ extern "C" {
 #endif
 
 #ifndef TCP_SERVER_IP
-#define TCP_SERVER_IP "192.168.8.158"
+#define TCP_SERVER_IP "192.168.8.175"
 #endif
 
 #ifndef TCP_SERVER_PORT
 #define TCP_SERVER_PORT 12345
 #endif
 
-#ifndef STATUS_LED_PIN
-#define STATUS_LED_PIN 13
+#ifndef LED_R_PIN
+#define LED_R_PIN 12
+#endif
+
+#ifndef LED_G_PIN
+#define LED_G_PIN 27
+#endif
+
+#ifndef LED_B_PIN
+#define LED_B_PIN 33
+#endif
+
+#ifndef LED_ACTIVE_LOW
+#define LED_ACTIVE_LOW 0
 #endif
 
 #if ENABLE_FPA_DEBUG
@@ -113,8 +128,37 @@ static float wrapAngleDeg(float deg) {
   return deg;
 }
 
-static void setStatusLed(bool on) {
-  digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
+static void setColor(bool r, bool g, bool b) {
+#if LED_ACTIVE_LOW
+  digitalWrite(LED_R_PIN, r ? LOW : HIGH);
+  digitalWrite(LED_G_PIN, g ? LOW : HIGH);
+  digitalWrite(LED_B_PIN, b ? LOW : HIGH);
+#else
+  digitalWrite(LED_R_PIN, r ? HIGH : LOW);
+  digitalWrite(LED_G_PIN, g ? HIGH : LOW);
+  digitalWrite(LED_B_PIN, b ? HIGH : LOW);
+#endif
+}
+
+static void selectMultiplexerChannel(uint8_t ch) {
+  if (ch > 7) return;
+  Wire.beginTransmission(PCA9548A_ADDRESS);
+  Wire.write(1u << ch);
+  Wire.endTransmission();
+}
+
+static void showConnectionStatus() {
+#if ENABLE_TCP_STREAM
+  if (g_tcpConnected) {
+    setColor(false, true, false); // green
+  } else if (g_wifiConnected) {
+    setColor(false, true, true);  // cyan
+  } else {
+    setColor(true, true, false);  // amber
+  }
+#else
+  setColor(false, false, false);
+#endif
 }
 
 static bool getZeroedOrientation(float* outRollDeg, float* outPitchDeg, float* outYawDeg) {
@@ -150,9 +194,9 @@ static void handleTcpCommand(const char* cmd) {
   }
   if (strcasecmp(cmd, "ze") == 0) {
     zeroFootOrientation();
-    setStatusLed(true);
+    setColor(true, true, true);
     delay(50);
-    setStatusLed(g_tcpConnected);
+    showConnectionStatus();
 #if ENABLE_TCP_STREAM
     if (g_tcpClient.connected()) {
       g_tcpClient.println(F("ACK ZE"));
@@ -242,7 +286,7 @@ static void maintainNetwork() {
   if (tcpNow != g_tcpConnected) {
     g_tcpConnected = tcpNow;
   }
-  setStatusLed(g_tcpConnected);
+  showConnectionStatus();
 #endif
 }
 
@@ -351,9 +395,14 @@ void setup() {
   Wire.setClock(400000);
   delay(100);
 
+  selectMultiplexerChannel(0); // route IMU channel before initialization
+
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  setColor(false, false, false);
+
 #if ENABLE_TCP_STREAM
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  setStatusLed(false);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   uint32_t wifiStart = millis();
@@ -365,10 +414,9 @@ void setup() {
   if (g_wifiConnected) {
     attemptTcpConnect();
   }
-  setStatusLed(g_wifiConnected && g_tcpClient.connected());
+  showConnectionStatus();
 #else
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  setStatusLed(false);
+  showConnectionStatus();
 #endif
 
   DEBUG_PRINTLN(F("BNO085 + VQF-C (PlatformIO)"));
@@ -392,6 +440,7 @@ void setup() {
   for (int i = 0; i < 2; ++i) {
     uint8_t a = triedAddrs[i];
     DEBUG_PRINTF("Trying BNO init at 0x%02X...\n", a);
+    selectMultiplexerChannel(0);
     if (bno08x.begin_I2C(a, &Wire)) {
       usedAddr = a;
       bnoPresent = true;
@@ -441,6 +490,7 @@ void loop() {
   maintainNetwork();
   pollTcpCommands();
 
+  selectMultiplexerChannel(0);
   sh2_SensorValue_t evt;
   while (bno08x.getSensorEvent(&evt)) {
     switch (evt.sensorId) {
