@@ -170,6 +170,8 @@ static unsigned long g_lastWifiAttemptMs = 0;
 static unsigned long g_lastTcpAttemptMs = 0;
 static char g_tcpCmdBuf[32];
 static size_t g_tcpCmdLen = 0;
+static char g_serialCmdBuf[32];
+static size_t g_serialCmdLen = 0;
 
 static void quatToEulerDeg(const float q[4], float* outRollDeg, float* outPitchDeg, float* outYawDeg) {
   // q = (w, x, y, z)
@@ -262,7 +264,7 @@ static void zeroFootOrientation() {
 }
 
 
-static void handleTcpCommand(const char* cmd) {
+static void handleCommand(const char* cmd) {
   if (!cmd || !cmd[0]) return;
 
   // trim leading spaces
@@ -373,7 +375,7 @@ static void handleTcpCommand(const char* cmd) {
   }
 
   // Unknown
-  DEBUG_PRINT(F("Unknown TCP cmd: "));
+  DEBUG_PRINT(F("Unknown cmd: "));
   DEBUG_PRINTLN(cmd);
 }
 
@@ -395,7 +397,7 @@ static void pollTcpCommands() {
     if (c == '\n') {
       if (g_tcpCmdLen > 0) {
         g_tcpCmdBuf[g_tcpCmdLen] = '\0';
-        handleTcpCommand(g_tcpCmdBuf);
+        handleCommand(g_tcpCmdBuf);
         g_tcpCmdLen = 0;
       }
       continue;
@@ -409,6 +411,30 @@ static void pollTcpCommands() {
 #endif
 }
 
+static void pollSerialCommands() {
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c < 0) {
+      break;
+    }
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      if (g_serialCmdLen > 0) {
+        g_serialCmdBuf[g_serialCmdLen] = '\0';
+        handleCommand(g_serialCmdBuf);
+        g_serialCmdLen = 0;
+      }
+      continue;
+    }
+    if (g_serialCmdLen + 1 < sizeof(g_serialCmdBuf)) {
+      g_serialCmdBuf[g_serialCmdLen++] = static_cast<char>(c);
+    } else {
+      g_serialCmdLen = 0; // overflow, reset buffer
+    }
+  }
+}
 static void sendTcpTelemetry(float rollDeg, float pitchDeg, float yawDeg) {
 #if ENABLE_TCP_STREAM
   if (!g_tcpClient.connected()) {
@@ -703,6 +729,7 @@ void setup() {
 void loop() {
   maintainNetwork();
   pollTcpCommands();
+  pollSerialCommands();
 
   selectMultiplexerChannel(0);
   sh2_SensorValue_t evt;

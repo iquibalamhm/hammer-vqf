@@ -24,12 +24,13 @@ try:
     import serial  # pyserial (only needed for --port)
 except Exception:
     serial = None
-
 try:
     from vqf import VQF
     HAVE_VQF = True
 except Exception:
+    # vqf python module intentionally not used in this GUI; disable
     HAVE_VQF = False
+
 
 # -------- GUI deps (required) ----
 import pyqtgraph as pg
@@ -83,6 +84,70 @@ def update_foot_orientation_from_serial(line: str):
     FOOT_ORIENTATION.update(vals[0], vals[1], vals[2])
 
 
+class RPY3DWindow(QtWidgets.QMainWindow):
+    def __init__(self, parent=None, axis_len=0.3):
+        super().__init__(parent)
+        self.setWindowTitle("RPY 3D View")
+        self.resize(520, 520)
+
+        self.axis_len = axis_len
+        self.glview = gl.GLViewWidget()
+        self.glview.setBackgroundColor((30, 30, 30, 255))
+        self.glview.opts['distance'] = 0.8
+        self.glview.opts['elevation'] = 18
+        self.glview.opts['azimuth'] = 45
+
+        central = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.glview)
+        self.setCentralWidget(central)
+
+        grid = gl.GLGridItem()
+        grid.scale(0.1, 0.1, 0.1)
+        self.glview.addItem(grid)
+
+        self.axis_items = []
+        colors = [
+            (1.0, 0.2, 0.2, 1.0),  # X axis (red)
+            (0.2, 1.0, 0.2, 1.0),  # Y axis (green)
+            (0.2, 0.4, 1.0, 1.0),  # Z axis (blue)
+        ]
+        origin = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float)
+        for color in colors:
+            item = gl.GLLinePlotItem(pos=origin.copy(), color=color, width=3, antialias=True, mode='lines')
+            self.glview.addItem(item)
+            self.axis_items.append(item)
+
+        self.set_orientation(0.0, 0.0, 0.0)
+
+    @staticmethod
+    def _rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
+        roll = math.radians(roll_deg)
+        pitch = math.radians(pitch_deg)
+        yaw = math.radians(yaw_deg)
+        sr, cr = math.sin(roll), math.cos(roll)
+        sp, cp = math.sin(pitch), math.cos(pitch)
+        sy, cy = math.sin(yaw), math.cos(yaw)
+        return np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp,     cp * sr,                 cp * cr               ],
+        ], dtype=float)
+
+    def set_orientation(self, roll_deg, pitch_deg, yaw_deg):
+        if not self.axis_items:
+            return
+        r = 0.0 if not math.isfinite(roll_deg) else roll_deg
+        p = 0.0 if not math.isfinite(pitch_deg) else pitch_deg
+        y = 0.0 if not math.isfinite(yaw_deg) else yaw_deg
+        R = self._rpy_to_matrix(r, p, y)
+        for idx in range(3):
+            axis_vec = R[:, idx] * self.axis_len
+            pts = np.array([[0.0, 0.0, 0.0], axis_vec], dtype=float)
+            self.axis_items[idx].setData(pos=pts)
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     src = ap.add_mutually_exclusive_group(required=True)
@@ -101,6 +166,8 @@ def parse_args():
                     default=["accel", "gyro", "mag", "orientation", "fpa", "foot-axis"],
                     help="Plots to display (e.g. --plots accel gyro fpa foot-axis). Default shows all;"
                          " foot-axis requires pyqtgraph.opengl.")
+    ap.add_argument("--rpy-3d", action="store_true",
+                    help="Show extra roll/pitch/yaw window (requires pyqtgraph.opengl)")
     return ap.parse_args()
 
 
@@ -170,6 +237,7 @@ class ReaderThread(threading.Thread):
         self.stop_evt = stop_evt
         self.ser = None
         self.fp = None
+        self.cmd_q = queue.Queue()
 
     def open(self):
         if self.filepath:
@@ -222,6 +290,13 @@ class ReaderThread(threading.Thread):
                 except queue.Full:
                     # drop if GUI is behind (keeps latency low)
                     pass
+                # send any pending commands
+                try:
+                    cmd = self.cmd_q.get_nowait()
+                    if self.ser and self.ser.is_open:
+                        self.ser.write((cmd + '\n').encode('utf-8'))
+                except queue.Empty:
+                    pass
         finally:
             self.close()
 
@@ -243,17 +318,14 @@ class IMUWindow(QtWidgets.QMainWindow):
                   file=sys.stderr)
             self.plots_enabled.discard("foot-axis")
 
-        orientation_requested = "orientation" in self.plots_enabled
-        self.use_vqf = (not args.no_orientation) and HAVE_VQF and orientation_requested
-        if orientation_requested and not self.use_vqf:
-            if args.no_orientation:
-                reason = "disabled via --no-orientation"
-            elif not HAVE_VQF:
-                reason = "vqf module not installed"
-            else:
-                reason = "orientation unavailable"
-            print(f"[imu_printfpa] orientation plot unavailable ({reason}); disabling.",
-                  file=sys.stderr)
+        # Enable foot-axis if orientation is enabled (since foot-axis shows foot orientation from serial)
+        if "orientation" in self.plots_enabled and HAVE_GL:
+            self.plots_enabled.add("foot-axis")
+
+        # Orientation plotting will use serial-provided footRoll/pitch/yaw values.
+        # If user explicitly disables orientation, honor that flag.
+        if args.no_orientation and ("orientation" in self.plots_enabled):
+            print(f"[imu_printfpa] orientation plot disabled via --no-orientation", file=sys.stderr)
             self.plots_enabled.discard("orientation")
 
         # Data buffers (deques of (t, value))
@@ -272,7 +344,9 @@ class IMUWindow(QtWidgets.QMainWindow):
             self.buf["fpa"] = deque()
         self._samples_key = next(iter(self.buf), None)
 
-        # Orientation (optional)
+        # Orientation (from serial footRoll/pitch/yaw)
+        # Whether to compute VQF locally (disabled if vqf module not available)
+        self.use_vqf = (not args.no_orientation) and HAVE_VQF
         self.vqf = VQF() if self.use_vqf else None
         self.prev_t = None
 
@@ -291,6 +365,15 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.plot_mag = self.cur_mx = self.cur_my = self.cur_mz = None
         self.plot_rpy = self.cur_roll = self.cur_pitch = self.cur_yaw = None
         self.plot_fpa = self.cur_fpa = None
+
+        # GL failure message (set when init/draw fails)
+        self._gl_failed_msg = None
+
+        self.rpy3d_window = None
+
+        # Numeric RPY readouts (always present so user can verify orientation)
+        self.rpy_widget = None
+        self.rpy_labels = (None, None, None)
 
         # UI layout
         central = QtWidgets.QWidget(self)
@@ -350,27 +433,100 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.glview = None
         self.axis_items = []
         self.axis_len = 0.15
+        # Foot-axis: show 3D GL view when available and always provide a 2D XY fallback
+        self.fallback_axes_plot = None
+        self.axis2d_lines = []
         if "foot-axis" in self.plots_enabled:
-            self.glview = gl.GLViewWidget()
-            self.glview.setBackgroundColor((30, 30, 30, 255))
-            self.glview.opts['distance'] = 0.6
-            self.glview.opts['elevation'] = 18
-            self.glview.opts['azimuth'] = 45
-            grid = gl.GLGridItem()
-            grid.scale(0.1, 0.1, 0.1)
-            self.glview.addItem(grid)
-            self._init_foot_axes()
-            vbox.addWidget(self.glview, stretch=1)
+            if HAVE_GL:
+                self.glview = gl.GLViewWidget()
+                self.glview.setBackgroundColor((30, 30, 30, 255))
+                self.glview.opts['distance'] = 0.6
+                self.glview.opts['elevation'] = 18
+                self.glview.opts['azimuth'] = 45
+                grid = gl.GLGridItem()
+                grid.scale(0.1, 0.1, 0.1)
+                self.glview.addItem(grid)
+                self._init_foot_axes()
+                vbox.addWidget(self.glview, stretch=1)
+                # small status label for GL diagnostics
+                try:
+                    self.gl_status_label = QtWidgets.QLabel("GL: initialized")
+                except Exception:
+                    self.gl_status_label = None
+                if self.gl_status_label is not None:
+                    vbox.addWidget(self.gl_status_label, stretch=0)
+
+            # 2D fallback: simple XY projection of the 3 axes (always created so user always sees orientation)
+            self.fallback_axes_plot = pg.PlotWidget(title="Foot Axis (XY projection)")
+            self.fallback_axes_plot.showGrid(x=True, y=True, alpha=0.3)
+            # create three colored lines for X (red), Y (green), Z (blue)
+            self.axis2d_lines = [
+                self.fallback_axes_plot.plot([], [], pen=pg.mkPen((255, 51, 51), width=3), name="X"),
+                self.fallback_axes_plot.plot([], [], pen=pg.mkPen((51, 255, 51), width=3), name="Y"),
+                self.fallback_axes_plot.plot([], [], pen=pg.mkPen((51, 102, 255), width=3), name="Z"),
+            ]
+            self.fallback_axes_plot.setAspectLocked(True)
+            # set a visible default range centered at origin
+            rng = self.axis_len * 2.0
+            self.fallback_axes_plot.setXRange(-rng, rng, padding=0)
+            self.fallback_axes_plot.setYRange(-rng, rng, padding=0)
+            vbox.addWidget(self.fallback_axes_plot, stretch=0)
+
+        if args.rpy_3d:
+            if not HAVE_GL:
+                print("[imu_printfpa] --rpy-3d requested but pyqtgraph.opengl unavailable; ignoring.",
+                      file=sys.stderr)
+            else:
+                try:
+                    self.rpy3d_window = RPY3DWindow(parent=self)
+                    self.rpy3d_window.show()
+                    self.rpy3d_window.raise_()
+                except Exception as exc:
+                    print(f"[imu_printfpa] Failed to initialize RPY 3D window: {exc}", file=sys.stderr)
+                    self.rpy3d_window = None
+
+            # Numeric RPY readout: large labels for Roll / Pitch / Yaw
+            self.rpy_widget = QtWidgets.QWidget()
+            rpy_layout = QtWidgets.QHBoxLayout(self.rpy_widget)
+            self.rpy_lbl_roll = QtWidgets.QLabel("Roll: --.-°")
+            self.rpy_lbl_pitch = QtWidgets.QLabel("Pitch: --.-°")
+            self.rpy_lbl_yaw = QtWidgets.QLabel("Yaw: --.-°")
+            for lbl in (self.rpy_lbl_roll, self.rpy_lbl_pitch, self.rpy_lbl_yaw):
+                lbl.setStyleSheet("font-size:18px; padding:6px;")
+                rpy_layout.addWidget(lbl)
+            vbox.addWidget(self.rpy_widget, stretch=0)
+
+            # GL enable/disable checkbox (runtime toggle)
+            self.gl_enable_cb = QtWidgets.QCheckBox("Enable 3D GL")
+            self.gl_enable_cb.setChecked(HAVE_GL and ("foot-axis" in self.plots_enabled))
+            self.gl_enable_cb.stateChanged.connect(self._on_gl_toggle)
+            vbox.addWidget(self.gl_enable_cb, stretch=0)
+            # If GL already failed during init, propagate the error to label and disable checkbox
+            if getattr(self, '_gl_failed_msg', None):
+                try:
+                    if hasattr(self, 'gl_status_label') and self.gl_status_label is not None:
+                        self.gl_status_label.setText(self._gl_failed_msg)
+                except Exception:
+                    pass
+                try:
+                    self.gl_enable_cb.setChecked(False)
+                except Exception:
+                    pass
 
         # Reader thread + timer to drain queue
         self.q = queue.Queue(maxsize=args.queue_max)
         self.stop_evt = threading.Event()
         self.reader = ReaderThread(args.port, args.baud, args.file, self.q, self.stop_evt)
+        self.cmd_q = self.reader.cmd_q
         self.reader.start()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start(int(1000 / max(1.0, args.ui_hz)))
+
+        # Parameter controls
+        self.controls = self.make_controls()
+        vbox.addWidget(self.controls)
 
         # status text
         self.status = self.statusBar()
@@ -382,7 +538,133 @@ class IMUWindow(QtWidgets.QMainWindow):
             self.reader.join(timeout=1.0)
         except Exception:
             pass
+        try:
+            if self.rpy3d_window is not None:
+                self.rpy3d_window.close()
+        except Exception:
+            pass
         ev.accept()
+
+    def send_command(self, cmd):
+        self.cmd_q.put(cmd)
+
+    def make_controls(self):
+        group = QtWidgets.QGroupBox("Parameter Controls")
+        form = QtWidgets.QFormLayout(group)
+
+        # VQF params
+        self.vqf_tau_acc_edit = QtWidgets.QLineEdit("3.0")
+        form.addRow("VQF Tau Acc (s):", self.vqf_tau_acc_edit)
+
+        self.vqf_tau_mag_edit = QtWidgets.QLineEdit("9.0")
+        form.addRow("VQF Tau Mag (s):", self.vqf_tau_mag_edit)
+
+        self.vqf_motion_bias_cb = QtWidgets.QCheckBox()
+        self.vqf_motion_bias_cb.setChecked(True)
+        form.addRow("VQF Motion Bias:", self.vqf_motion_bias_cb)
+
+        self.vqf_rest_bias_cb = QtWidgets.QCheckBox()
+        self.vqf_rest_bias_cb.setChecked(True)
+        form.addRow("VQF Rest Bias:", self.vqf_rest_bias_cb)
+
+        self.vqf_mag_reject_cb = QtWidgets.QCheckBox()
+        self.vqf_mag_reject_cb.setChecked(True)
+        form.addRow("VQF Mag Reject:", self.vqf_mag_reject_cb)
+
+        self.vqf_use_mag_cb = QtWidgets.QCheckBox()
+        self.vqf_use_mag_cb.setChecked(False)
+        form.addRow("VQF Use Mag:", self.vqf_use_mag_cb)
+
+        # FPA params
+        self.fpa_offset_edit = QtWidgets.QLineEdit("0.0")
+        form.addRow("FPA Offset (deg):", self.fpa_offset_edit)
+
+        self.fpa_median_edit = QtWidgets.QLineEdit("1")
+        form.addRow("FPA Median Win:", self.fpa_median_edit)
+
+        self.fpa_lowpass_edit = QtWidgets.QLineEdit("0.0")
+        form.addRow("FPA Lowpass (Hz):", self.fpa_lowpass_edit)
+
+        self.fpa_acc_diff_edit = QtWidgets.QLineEdit("0.455")
+        form.addRow("FPA Acc Diff Th:", self.fpa_acc_diff_edit)
+
+        self.fpa_gyr_norm_edit = QtWidgets.QLineEdit("1.0")
+        form.addRow("FPA Gyr Norm Th:", self.fpa_gyr_norm_edit)
+
+        self.fpa_hys_frac_edit = QtWidgets.QLineEdit("0.15")
+        form.addRow("FPA Hys Frac:", self.fpa_hys_frac_edit)
+
+        self.fpa_min_rest_edit = QtWidgets.QLineEdit("0.08")
+        form.addRow("FPA Min Rest (s):", self.fpa_min_rest_edit)
+
+        self.fpa_min_motion_edit = QtWidgets.QLineEdit("0.06")
+        form.addRow("FPA Min Motion (s):", self.fpa_min_motion_edit)
+
+        # Buttons
+        hbox = QtWidgets.QHBoxLayout()
+        send_vqf_btn = QtWidgets.QPushButton("Send VQF")
+        send_vqf_btn.clicked.connect(self.send_vqf_params)
+        hbox.addWidget(send_vqf_btn)
+
+        send_fpa_btn = QtWidgets.QPushButton("Send FPA")
+        send_fpa_btn.clicked.connect(self.send_fpa_params)
+        hbox.addWidget(send_fpa_btn)
+
+        send_all_btn = QtWidgets.QPushButton("Send All")
+        send_all_btn.clicked.connect(self.send_all_params)
+        hbox.addWidget(send_all_btn)
+
+        form.addRow(hbox)
+
+        return group
+
+    def send_vqf_params(self):
+        tau_acc = self.vqf_tau_acc_edit.text()
+        self.send_command(f"vqf.tau_acc={tau_acc}")
+
+        tau_mag = self.vqf_tau_mag_edit.text()
+        self.send_command(f"vqf.tau_mag={tau_mag}")
+
+        motion_bias = 1 if self.vqf_motion_bias_cb.isChecked() else 0
+        self.send_command(f"vqf.motion_bias={motion_bias}")
+
+        rest_bias = 1 if self.vqf_rest_bias_cb.isChecked() else 0
+        self.send_command(f"vqf.rest_bias={rest_bias}")
+
+        mag_reject = 1 if self.vqf_mag_reject_cb.isChecked() else 0
+        self.send_command(f"vqf.mag_reject={mag_reject}")
+
+        use_mag = 1 if self.vqf_use_mag_cb.isChecked() else 0
+        self.send_command(f"vqf.use_mag={use_mag}")
+
+    def send_fpa_params(self):
+        offset = self.fpa_offset_edit.text()
+        self.send_command(f"fpa.offset_deg={offset}")
+
+        median = self.fpa_median_edit.text()
+        self.send_command(f"fpa.median_win={median}")
+
+        lowpass = self.fpa_lowpass_edit.text()
+        self.send_command(f"fpa.lowpass_hz={lowpass}")
+
+        acc_diff = self.fpa_acc_diff_edit.text()
+        self.send_command(f"fpa.acc_diff_th={acc_diff}")
+
+        gyr_norm = self.fpa_gyr_norm_edit.text()
+        self.send_command(f"fpa.gyr_norm_th={gyr_norm}")
+
+        hys_frac = self.fpa_hys_frac_edit.text()
+        self.send_command(f"fpa.hys_frac={hys_frac}")
+
+        min_rest = self.fpa_min_rest_edit.text()
+        self.send_command(f"fpa.min_rest_s={min_rest}")
+
+        min_motion = self.fpa_min_motion_edit.text()
+        self.send_command(f"fpa.min_motion_s={min_motion}")
+
+    def send_all_params(self):
+        self.send_vqf_params()
+        self.send_fpa_params()
 
     # ---------- helpers ----------
     @staticmethod
@@ -432,6 +714,17 @@ class IMUWindow(QtWidgets.QMainWindow):
             [-sp,     cp * sr,                 cp * cr               ]
         ], dtype=float)
 
+    def update_rpy3d_window(self):
+        if self.rpy3d_window is None:
+            return
+        roll = self.foot_roll if math.isfinite(self.foot_roll) else 0.0
+        pitch = self.foot_pitch if math.isfinite(self.foot_pitch) else 0.0
+        yaw = self.foot_yaw if math.isfinite(self.foot_yaw) else 0.0
+        try:
+            self.rpy3d_window.set_orientation(roll, pitch, yaw)
+        except Exception as exc:
+            print(f"[imu_printfpa] Failed to update RPY 3D window: {exc}", file=sys.stderr)
+
     def _init_foot_axes(self):
         if not HAVE_GL or self.glview is None:
             return
@@ -442,25 +735,107 @@ class IMUWindow(QtWidgets.QMainWindow):
         ]
         origin = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float)
         for color in colors:
-            item = gl.GLLinePlotItem(pos=origin.copy(), color=color, width=3, antialias=True, mode='line_strip')
-            self.axis_items.append(item)
-            self.glview.addItem(item)
+            try:
+                # use 'lines' mode which is more compatible in some environments
+                item = gl.GLLinePlotItem(pos=origin.copy(), color=color, width=3, antialias=True, mode='lines')
+                self.axis_items.append(item)
+                self.glview.addItem(item)
+            except Exception as e:
+                # record error to status label and continue
+                if hasattr(self, 'gl_status_label') and self.gl_status_label is not None:
+                    self.gl_status_label.setText(f"GL init error: {e}")
+        # Try to nudge camera distance so small axes are visible
+        try:
+            self.glview.opts['distance'] = max(self.glview.opts.get('distance', 0.6), 0.2)
+        except Exception:
+            pass
         self.update_foot_axes(force_identity=True)
 
-    def update_foot_axes(self, force_identity=False):
-        if not HAVE_GL or self.glview is None or not self.axis_items:
+    def _on_gl_toggle(self, state):
+        # show/hide the GL widget based on checkbox state
+        enabled = bool(state)
+        if not HAVE_GL:
+            # can't enable
+            try:
+                self.gl_enable_cb.setChecked(False)
+            except Exception:
+                pass
             return
-        if force_identity:
-            roll = pitch = yaw = 0.0
-        else:
-            roll = self.foot_roll if math.isfinite(self.foot_roll) else 0.0
-            pitch = self.foot_pitch if math.isfinite(self.foot_pitch) else 0.0
-            yaw = self.foot_yaw if math.isfinite(self.foot_yaw) else 0.0
-        R = self._rpy_to_matrix(roll, pitch, yaw)
-        for idx in range(3):
-            axis_vec = R[:, idx] * self.axis_len
-            pts = np.array([[0.0, 0.0, 0.0], axis_vec], dtype=float)
-            self.axis_items[idx].setData(pos=pts)
+        try:
+            if enabled and self.glview is None:
+                # try to create glview now
+                try:
+                    self.glview = gl.GLViewWidget()
+                    self.glview.setBackgroundColor((30, 30, 30, 255))
+                    self._init_foot_axes()
+                    # insert before fallback_axes_plot if layout available
+                    # best-effort: add to main vbox
+                    self.centralWidget().layout().insertWidget(0, self.glview)
+                except Exception as e:
+                    self._gl_failed_msg = f"GL init error: {e}"
+                    if hasattr(self, 'gl_status_label') and self.gl_status_label is not None:
+                        self.gl_status_label.setText(self._gl_failed_msg)
+                    self.gl_enable_cb.setChecked(False)
+            elif not enabled and self.glview is not None:
+                try:
+                    # remove widget from layout
+                    self.centralWidget().layout().removeWidget(self.glview)
+                    self.glview.setParent(None)
+                    self.glview = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def update_foot_axes(self, force_identity=False):
+        # Update 3D GL axes if present
+        if HAVE_GL and self.glview is not None and self.axis_items:
+            if force_identity:
+                roll = pitch = yaw = 0.0
+            else:
+                roll = self.foot_roll if math.isfinite(self.foot_roll) else 0.0
+                pitch = self.foot_pitch if math.isfinite(self.foot_pitch) else 0.0
+                yaw = self.foot_yaw if math.isfinite(self.foot_yaw) else 0.0
+            R = self._rpy_to_matrix(roll, pitch, yaw)
+            for idx in range(3):
+                axis_vec = R[:, idx] * self.axis_len
+                pts = np.array([[0.0, 0.0, 0.0], axis_vec], dtype=float)
+                try:
+                    # GLLinePlotItem expects a (N,3) array for 'pos'
+                    self.axis_items[idx].setData(pos=pts)
+                except Exception as e:
+                    msg = f"GL draw error: {e}"
+                    self._gl_failed_msg = msg
+                    if hasattr(self, 'gl_status_label') and self.gl_status_label is not None:
+                        self.gl_status_label.setText(msg)
+                    # hide GL widget and uncheck the checkbox
+                    try:
+                        if self.glview is not None:
+                            self.centralWidget().layout().removeWidget(self.glview)
+                            self.glview.setParent(None)
+                            self.glview = None
+                        if hasattr(self, 'gl_enable_cb'):
+                            self.gl_enable_cb.setChecked(False)
+                    except Exception:
+                        pass
+
+        # Update 2D fallback XY projection if present (always update so user sees orientation)
+        if self.fallback_axes_plot is not None and self.axis2d_lines:
+            if force_identity:
+                roll = pitch = yaw = 0.0
+            else:
+                roll = self.foot_roll if math.isfinite(self.foot_roll) else 0.0
+                pitch = self.foot_pitch if math.isfinite(self.foot_pitch) else 0.0
+                yaw = self.foot_yaw if math.isfinite(self.foot_yaw) else 0.0
+            R = self._rpy_to_matrix(roll, pitch, yaw)
+            # X-axis projection (X vs Y)
+            x_axis = R[:, 0] * self.axis_len
+            y_axis = R[:, 1] * self.axis_len
+            z_axis = R[:, 2] * self.axis_len
+            # For 2D view we'll plot X and Y components in XY plane
+            self.axis2d_lines[0].setData([0.0, x_axis[0]], [0.0, x_axis[1]])
+            self.axis2d_lines[1].setData([0.0, y_axis[0]], [0.0, y_axis[1]])
+            self.axis2d_lines[2].setData([0.0, z_axis[0]], [0.0, z_axis[1]])
 
     def on_timer(self):
         # drain queue
@@ -555,6 +930,24 @@ class IMUWindow(QtWidgets.QMainWindow):
 
         self.pull_latest_foot_orientation()
         self.update_foot_axes()
+        self.update_rpy3d_window()
+
+        # update numeric RPY labels so user always sees orientation even if GL fails
+        try:
+            if math.isfinite(self.foot_roll):
+                self.rpy_lbl_roll.setText(f"Roll: {self.foot_roll:.1f}°")
+            else:
+                self.rpy_lbl_roll.setText("Roll: --.-°")
+            if math.isfinite(self.foot_pitch):
+                self.rpy_lbl_pitch.setText(f"Pitch: {self.foot_pitch:.1f}°")
+            else:
+                self.rpy_lbl_pitch.setText("Pitch: --.-°")
+            if math.isfinite(self.foot_yaw):
+                self.rpy_lbl_yaw.setText(f"Yaw: {self.foot_yaw:.1f}°")
+            else:
+                self.rpy_lbl_yaw.setText("Yaw: --.-°")
+        except Exception:
+            pass
 
         # update curves if we got anything
         if drained:

@@ -9,11 +9,12 @@ Install:
   pip install pyqtgraph PyQt5 pyserial vqf
 
 Examples:
-  python imu_tui.py --port /dev/ttyACM0 --baud 115200 --gyro-units rad
-  python imu_tui.py --file sample.csv --gyro-units rad
-  python imu_tui.py --file sample.csv --no-orientation
+  python imu_print6d9d.py --port /dev/ttyACM0 --baud 115200 --gyro-units rad
+  python imu_print6d9d.py --file sample.csv --gyro-units rad
+  python imu_print6d9d.py --file sample.csv --no-orientation
 """
 import sys, math, time, threading, queue, argparse
+import numpy as np
 from collections import deque
 
 # -------- optional deps ----------
@@ -32,6 +33,13 @@ except Exception:
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore
 
+try:
+    import pyqtgraph.opengl as gl
+    HAVE_GL = True
+except Exception:
+    gl = None
+    HAVE_GL = False
+
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -46,6 +54,8 @@ def parse_args():
     ap.add_argument("--no-orientation", action="store_true",
                     help="Disable VQF orientation")
     ap.add_argument("--queue-max", type=int, default=10000, help="Reader→GUI queue size")
+    ap.add_argument("--rpy-3d", action="store_true",
+                    help="Show roll/pitch/yaw in a separate 3D window (requires pyqtgraph.opengl)")
     return ap.parse_args()
 
 
@@ -133,6 +143,70 @@ class ReaderThread(threading.Thread):
             self.close()
 
 
+class RPY3DWindow(QtWidgets.QMainWindow):
+    def __init__(self, parent=None, axis_len=0.3):
+        super().__init__(parent)
+        self.setWindowTitle("RPY 3D View")
+        self.resize(520, 520)
+
+        self.axis_len = axis_len
+        self.glview = gl.GLViewWidget()
+        self.glview.setBackgroundColor((30, 30, 30, 255))
+        self.glview.opts['distance'] = 0.8
+        self.glview.opts['elevation'] = 18
+        self.glview.opts['azimuth'] = 45
+
+        central = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.glview)
+        self.setCentralWidget(central)
+
+        grid = gl.GLGridItem()
+        grid.scale(0.1, 0.1, 0.1)
+        self.glview.addItem(grid)
+
+        self.axis_items = []
+        colors = [
+            (1.0, 0.2, 0.2, 1.0),  # X axis (red)
+            (0.2, 1.0, 0.2, 1.0),  # Y axis (green)
+            (0.2, 0.4, 1.0, 1.0),  # Z axis (blue)
+        ]
+        origin = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float)
+        for color in colors:
+            item = gl.GLLinePlotItem(pos=origin.copy(), color=color, width=3, antialias=True, mode='lines')
+            self.glview.addItem(item)
+            self.axis_items.append(item)
+
+        self.set_orientation(0.0, 0.0, 0.0)
+
+    @staticmethod
+    def _rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
+        roll = math.radians(roll_deg)
+        pitch = math.radians(pitch_deg)
+        yaw = math.radians(yaw_deg)
+        sr, cr = math.sin(roll), math.cos(roll)
+        sp, cp = math.sin(pitch), math.cos(pitch)
+        sy, cy = math.sin(yaw), math.cos(yaw)
+        return np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp,     cp * sr,                 cp * cr               ],
+        ], dtype=float)
+
+    def set_orientation(self, roll_deg, pitch_deg, yaw_deg):
+        if not self.axis_items:
+            return
+        r = 0.0 if not math.isfinite(roll_deg) else roll_deg
+        p = 0.0 if not math.isfinite(pitch_deg) else pitch_deg
+        y = 0.0 if not math.isfinite(yaw_deg) else yaw_deg
+        R = self._rpy_to_matrix(r, p, y)
+        for idx in range(3):
+            axis_vec = R[:, idx] * self.axis_len
+            pts = np.array([[0.0, 0.0, 0.0], axis_vec], dtype=float)
+            self.axis_items[idx].setData(pos=pts)
+
+
 class IMUWindow(QtWidgets.QMainWindow):
     def __init__(self, args):
         super().__init__()
@@ -156,6 +230,24 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.use_vqf = (not args.no_orientation) and HAVE_VQF
         self.vqf = VQF() if self.use_vqf else None
         self.prev_t = None
+        self.last_roll = math.nan
+        self.last_pitch = math.nan
+        self.last_yaw = math.nan
+
+        self.rpy3d_window = None
+        if args.rpy_3d:
+            if not HAVE_GL:
+                print("[imu_print6d9d] --rpy-3d requested but pyqtgraph.opengl is unavailable; ignoring.", file=sys.stderr)
+            else:
+                if not self.use_vqf:
+                    print("[imu_print6d9d] --rpy-3d requested but orientation is disabled; showing identity axes only.", file=sys.stderr)
+                try:
+                    self.rpy3d_window = RPY3DWindow(parent=self)
+                    self.rpy3d_window.show()
+                    self.rpy3d_window.raise_()
+                except Exception as e:
+                    print(f"[imu_print6d9d] Failed to initialize 3D RPY window: {e}", file=sys.stderr)
+                    self.rpy3d_window = None
 
         # UI layout
         central = QtWidgets.QWidget(self)
@@ -217,6 +309,11 @@ class IMUWindow(QtWidgets.QMainWindow):
             self.reader.join(timeout=1.0)
         except Exception:
             pass
+        try:
+            if self.rpy3d_window is not None:
+                self.rpy3d_window.close()
+        except Exception:
+            pass
         ev.accept()
 
     # ---------- helpers ----------
@@ -243,6 +340,17 @@ class IMUWindow(QtWidgets.QMainWindow):
         ts = [t for (t, _) in d]
         vs = [v for (_, v) in d]
         return ts, vs
+
+    def update_rpy3d_window(self, roll=None, pitch=None, yaw=None):
+        if self.rpy3d_window is None:
+            return
+        r = self.last_roll if roll is None else roll
+        p = self.last_pitch if pitch is None else pitch
+        y = self.last_yaw if yaw is None else yaw
+        try:
+            self.rpy3d_window.set_orientation(r, p, y)
+        except Exception as exc:
+            print(f"[imu_print6d9d] Failed to update RPY 3D window: {exc}", file=sys.stderr)
 
     def on_timer(self):
         # drain queue
@@ -296,6 +404,10 @@ class IMUWindow(QtWidgets.QMainWindow):
                 self.append("roll", trel, roll)
                 self.append("pitch", trel, pitch)
                 self.append("yaw", trel, yaw)
+                self.last_roll = roll
+                self.last_pitch = pitch
+                self.last_yaw = yaw
+                self.update_rpy3d_window(roll, pitch, yaw)
 
         # update curves if we got anything
         if drained:
