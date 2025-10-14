@@ -17,11 +17,26 @@ extern "C" {
   #include "vqf.h" // community VQF-C header you dropped in lib/vqf_c
 }
 
+#ifndef ENABLE_FPA_TRACE
+#define ENABLE_FPA_TRACE 0
+#endif
+
+#if ENABLE_FPA_TRACE
+static void fpaTraceSample(uint32_t strideIdx,
+                           float sampleTimeS,
+                           float dtS,
+                           const float* vRaw,
+                           const float* vDf,
+                           const float* posE);
+#define FPA_TRACE_SAMPLE(strideIdx, sampleTimeS, dtS, vRawPtr, vDfPtr, posPtr) \
+  fpaTraceSample(strideIdx, sampleTimeS, dtS, vRawPtr, vDfPtr, posPtr)
+#endif
+
 // --- Foot Progression Angle ---
 #include "FPA.hpp"
 
 #ifndef ENABLE_FPA_DEBUG
-#define ENABLE_FPA_DEBUG 0
+#define ENABLE_FPA_DEBUG 1
 #endif
 
 #ifndef ENABLE_CSV_STREAM
@@ -73,7 +88,7 @@ extern "C" {
 #define DEBUG_PRINT(x) do {} while (0)
 #define DEBUG_PRINTF(...) do {} while (0)
 #endif
-static FPA g_fpa(/*is_left_foot=*/false); // set to false if this sensor is on the RIGHT foot
+static FPA g_fpa(/*is_left_foot=*/true); // set to false if this sensor is on the RIGHT foot
 static uint32_t g_lastFeedUs = 0;
 static float g_lastFeedDt = 0.0f;
 static bool g_lastFeedAccepted = false;
@@ -90,6 +105,27 @@ static float g_lastFootYawDeg = NAN;
 static float g_zeroRollDeg = 0.0f;
 static float g_zeroPitchDeg = 0.0f;
 static float g_zeroYawDeg = 0.0f;
+
+#if ENABLE_FPA_TRACE
+static void fpaTraceSample(uint32_t strideIdx,
+                           float sampleTimeS,
+                           float dtS,
+                           const float* vRaw,
+                           const float* vDf,
+                           const float* posE) {
+  if (!vRaw || !vDf || !posE) {
+    return;
+  }
+  Serial.printf(
+    "TRACE,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+    static_cast<unsigned long>(strideIdx),
+    sampleTimeS,
+    dtS,
+    vRaw[0], vRaw[1], vRaw[2],
+    vDf[0], vDf[1], vDf[2],
+    posE[0], posE[1], posE[2]);
+}
+#endif
 
 // ====== FPA Detection Thresholds (used by configure() calls) ======
 static const float FPA_ACC_DIFF_TH = 0.455f;  // moderate sensitivity

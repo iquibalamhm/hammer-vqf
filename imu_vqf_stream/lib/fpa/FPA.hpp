@@ -20,6 +20,15 @@
 #include <stdint.h>
 #include <math.h>
 
+#ifndef ENABLE_FPA_TRACE
+#define ENABLE_FPA_TRACE 1
+#endif
+
+#ifndef FPA_TRACE_SAMPLE
+#define FPA_TRACE_SAMPLE(stride_idx, sample_time_s, dt_s, v_raw_ptr, v_df_ptr, pos_ptr) \
+  do { (void)(stride_idx); (void)(sample_time_s); (void)(dt_s); (void)(v_raw_ptr); (void)(v_df_ptr); (void)(pos_ptr); } while (0)
+#endif
+
 struct FPA_Result {
   bool valid;          // true when a new FPA was computed for the most recent stride
   float fpa_deg;       // foot progression angle in degrees (positive = out‑toeing)
@@ -394,6 +403,10 @@ void FPA::integrate_and_compute_() {
     return; // too short
   }
 
+#if ENABLE_FPA_TRACE
+  uint32_t stride_index_trace = (stride_idx_ > 0) ? (stride_idx_ - 1u) : 0u;
+#endif
+
   // 1) integrate velocity from t_prev..t0 in E frame
   float v[3] = {0,0,0};
   float gE[3] = {0,0,9.81f};
@@ -424,6 +437,11 @@ void FPA::integrate_and_compute_() {
     };
     float dt = buf_dt_[i];
     p[0] += vdf[0]*dt; p[1] += vdf[1]*dt; p[2] += vdf[2]*dt;
+#if ENABLE_FPA_TRACE
+  float pos_curr[3] = {p[0], p[1], p[2]};
+  float t_rel = buf_t_[i] - t_prev;
+  FPA_TRACE_SAMPLE(stride_index_trace, t_rel, dt, v_raw[i], vdf, pos_curr);
+#endif
   }
   // stride horizontal displacement from t_prev..t0
   float dx = p[0], dy = p[1];

@@ -9,7 +9,7 @@ Install:
   pip install pyqtgraph PyQt5 pyserial vqf
 
 Examples:
-  python imu_printfpa.py --port /dev/ttyACM0 --baud 115200 --gyro-units rad
+  python imu_printfpa.py --port /dev/ttyACM0 --baud 115200 --gyro-units rad --rpy-3d
   python imu_printfpa.py --file sample.csv --gyro-units rad
   python imu_printfpa.py --file sample.csv --no-orientation
     python imu_printfpa.py --file sample.csv --plots accel gyro fpa
@@ -146,6 +146,55 @@ class RPY3DWindow(QtWidgets.QMainWindow):
             axis_vec = R[:, idx] * self.axis_len
             pts = np.array([[0.0, 0.0, 0.0], axis_vec], dtype=float)
             self.axis_items[idx].setData(pos=pts)
+
+
+class SensorPlotWindow(QtWidgets.QMainWindow):
+    def __init__(self, show_accel, show_gyro, show_mag, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sensor Streams")
+        self.resize(900, 720)
+
+        central = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(6, 6, 6, 6)
+        self.graph = pg.GraphicsLayoutWidget(show=True)
+        layout.addWidget(self.graph)
+        self.setCentralWidget(central)
+
+        self.plots = {}
+        self.curves = {}
+        self._layout_started = False
+
+        def make_plot(title):
+            if self._layout_started:
+                self.graph.nextRow()
+            else:
+                self._layout_started = True
+            plot = self.graph.addPlot(title=title)
+            plot.addLegend()
+            plot.showGrid(x=True, y=True, alpha=0.3)
+            return plot
+
+        if show_accel:
+            plot = make_plot("Acceleration (m/s²)")
+            self.plots["accel"] = plot
+            self.curves["ax"] = plot.plot([], [], pen=pg.mkPen((255, 120, 120), width=2), name="ax")
+            self.curves["ay"] = plot.plot([], [], pen=pg.mkPen((120, 255, 120), width=2), name="ay")
+            self.curves["az"] = plot.plot([], [], pen=pg.mkPen((120, 170, 255), width=2), name="az")
+
+        if show_gyro:
+            plot = make_plot("Gyroscope (deg/s)")
+            self.plots["gyro"] = plot
+            self.curves["gx"] = plot.plot([], [], pen=pg.mkPen((255, 180, 120), width=2), name="gx")
+            self.curves["gy"] = plot.plot([], [], pen=pg.mkPen((180, 255, 120), width=2), name="gy")
+            self.curves["gz"] = plot.plot([], [], pen=pg.mkPen((180, 200, 255), width=2), name="gz")
+
+        if show_mag:
+            plot = make_plot("Magnetometer (µT)")
+            self.plots["mag"] = plot
+            self.curves["mx"] = plot.plot([], [], pen=pg.mkPen((255, 220, 120), width=2), name="mx")
+            self.curves["my"] = plot.plot([], [], pen=pg.mkPen((160, 255, 200), width=2), name="my")
+            self.curves["mz"] = plot.plot([], [], pen=pg.mkPen((200, 200, 255), width=2), name="mz")
 
 
 def parse_args():
@@ -328,6 +377,21 @@ class IMUWindow(QtWidgets.QMainWindow):
             print(f"[imu_printfpa] orientation plot disabled via --no-orientation", file=sys.stderr)
             self.plots_enabled.discard("orientation")
 
+        self.sensor_window = None
+        self.sensor_plots = {}
+        self.sensor_curves = {}
+        if any(p in self.plots_enabled for p in ("accel", "gyro", "mag")):
+            self.sensor_window = SensorPlotWindow(
+                show_accel="accel" in self.plots_enabled,
+                show_gyro="gyro" in self.plots_enabled,
+                show_mag="mag" in self.plots_enabled,
+                parent=self,
+            )
+            self.sensor_window.show()
+            self.sensor_plots = dict(self.sensor_window.plots)
+            self.sensor_curves = dict(self.sensor_window.curves)
+            self.sensor_window.destroyed.connect(self._on_sensor_window_destroyed)
+
         # Data buffers (deques of (t, value))
         self.t0 = None
         self.t_last = 0.0
@@ -366,6 +430,19 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.plot_rpy = self.cur_roll = self.cur_pitch = self.cur_yaw = None
         self.plot_fpa = self.cur_fpa = None
 
+        self.plot_acc = self.sensor_plots.get("accel")
+        self.cur_ax = self.sensor_curves.get("ax")
+        self.cur_ay = self.sensor_curves.get("ay")
+        self.cur_az = self.sensor_curves.get("az")
+        self.plot_gyr = self.sensor_plots.get("gyro")
+        self.cur_gx = self.sensor_curves.get("gx")
+        self.cur_gy = self.sensor_curves.get("gy")
+        self.cur_gz = self.sensor_curves.get("gz")
+        self.plot_mag = self.sensor_plots.get("mag")
+        self.cur_mx = self.sensor_curves.get("mx")
+        self.cur_my = self.sensor_curves.get("my")
+        self.cur_mz = self.sensor_curves.get("mz")
+
         # GL failure message (set when init/draw fails)
         self._gl_failed_msg = None
 
@@ -391,30 +468,6 @@ class IMUWindow(QtWidgets.QMainWindow):
             else:
                 layout_started = True
             return self.glw.addPlot(title=title)
-
-        if "accel" in self.plots_enabled:
-            self.plot_acc = make_plot("Acceleration (m/s²)")
-            self.plot_acc.addLegend()
-            self.plot_acc.showGrid(x=True, y=True, alpha=0.3)
-            self.cur_ax = self.plot_acc.plot([], [], pen=pg.mkPen((255,120,120), width=2), name="ax")
-            self.cur_ay = self.plot_acc.plot([], [], pen=pg.mkPen((120,255,120), width=2), name="ay")
-            self.cur_az = self.plot_acc.plot([], [], pen=pg.mkPen((120,170,255), width=2), name="az")
-
-        if "gyro" in self.plots_enabled:
-            self.plot_gyr = make_plot("Gyroscope (deg/s)")
-            self.plot_gyr.addLegend()
-            self.plot_gyr.showGrid(x=True, y=True, alpha=0.3)
-            self.cur_gx = self.plot_gyr.plot([], [], pen=pg.mkPen((255,180,120), width=2), name="gx")
-            self.cur_gy = self.plot_gyr.plot([], [], pen=pg.mkPen((180,255,120), width=2), name="gy")
-            self.cur_gz = self.plot_gyr.plot([], [], pen=pg.mkPen((180,200,255), width=2), name="gz")
-
-        if "mag" in self.plots_enabled:
-            self.plot_mag = make_plot("Magnetometer (µT)")
-            self.plot_mag.addLegend()
-            self.plot_mag.showGrid(x=True, y=True, alpha=0.3)
-            self.cur_mx = self.plot_mag.plot([], [], pen=pg.mkPen((255,220,120), width=2), name="mx")
-            self.cur_my = self.plot_mag.plot([], [], pen=pg.mkPen((160,255,200), width=2), name="my")
-            self.cur_mz = self.plot_mag.plot([], [], pen=pg.mkPen((200,200,255), width=2), name="mz")
 
         if "orientation" in self.plots_enabled and self.use_vqf:
             self.plot_rpy = make_plot("Orientation (VQF, deg)")
@@ -541,6 +594,11 @@ class IMUWindow(QtWidgets.QMainWindow):
         try:
             if self.rpy3d_window is not None:
                 self.rpy3d_window.close()
+        except Exception:
+            pass
+        try:
+            if self.sensor_window is not None:
+                self.sensor_window.close()
         except Exception:
             pass
         ev.accept()
@@ -836,6 +894,14 @@ class IMUWindow(QtWidgets.QMainWindow):
             self.axis2d_lines[0].setData([0.0, x_axis[0]], [0.0, x_axis[1]])
             self.axis2d_lines[1].setData([0.0, y_axis[0]], [0.0, y_axis[1]])
             self.axis2d_lines[2].setData([0.0, z_axis[0]], [0.0, z_axis[1]])
+
+    def _on_sensor_window_destroyed(self, _obj=None):
+        self.sensor_window = None
+        self.sensor_plots = {}
+        self.sensor_curves = {}
+        self.plot_acc = self.cur_ax = self.cur_ay = self.cur_az = None
+        self.plot_gyr = self.cur_gx = self.cur_gy = self.cur_gz = None
+        self.plot_mag = self.cur_mx = self.cur_my = self.cur_mz = None
 
     def on_timer(self):
         # drain queue
