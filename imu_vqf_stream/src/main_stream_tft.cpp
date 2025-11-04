@@ -23,7 +23,73 @@
   #define I2C_SDA SDA
   #define I2C_SCL SCL
 #endif
+// === TFT display for ESP32-S2 Feather TFT ===
+#if defined(ARDUINO_ADAFRUIT_FEATHER_ESP32S2_TFT)
+  #include <Adafruit_GFX.h>
+  #include <Adafruit_ST7789.h>
+  #include <Fonts/FreeSans12pt7b.h>
 
+  // Board variant provides these pins:
+  // TFT_CS (GPIO7), TFT_DC (GPIO39), TFT_RST (GPIO40), TFT_BACKLITE (GPIO45)
+  Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
+  GFXcanvas16 canvas(240, 135);
+#endif
+
+if defined(ARDUINO_ADAFRUIT_FEATHER_ESP32S2_TFT)
+static void tftInitOnce() {
+  static bool inited = false;
+  if (inited) return;
+
+  // Ensure STEMMA QT/TFT/BME 3V3 rail is ON
+  #ifdef TFT_I2C_POWER
+    pinMode(TFT_I2C_POWER, OUTPUT);
+    digitalWrite(TFT_I2C_POWER, HIGH);
+    delay(5);
+  #endif
+
+  tft.init(135, 240);     // 240x135 panel, params per Adafruit example
+  tft.setRotation(3);
+
+  pinMode(TFT_BACKLITE, OUTPUT);
+  digitalWrite(TFT_BACKLITE, HIGH);
+
+  canvas.setFont(&FreeSans12pt7b);
+  canvas.setTextColor(ST77XX_WHITE);
+  inited = true;
+}
+
+/** Scan I2C bus and paint found addresses to the TFT (skips 0x36 by default). */
+static void tftShowI2CAddresses() {
+  tftInitOnce();
+
+  canvas.fillScreen(ST77XX_BLACK);
+  int y0 = 26;
+
+  canvas.setCursor(0, y0);
+  canvas.setTextColor(ST77XX_RED);
+  canvas.println("Adafruit Feather");
+  canvas.setTextColor(ST77XX_YELLOW);
+  canvas.println("ESP32-S2 TFT");
+  canvas.setTextColor(ST77XX_BLUE);
+  canvas.print("I2C: ");
+  canvas.setTextColor(ST77XX_WHITE);
+
+  uint8_t perLine = 8, printed = 0;
+  for (uint8_t addr = 1; addr < 0x7F; ++addr) {
+    if (addr == 0x36) continue; // battery gauge; hide like the example
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      char buf[6];
+      snprintf(buf, sizeof(buf), "0x%02X", addr);
+      canvas.print(buf);
+      canvas.print(", ");
+      if (++printed % perLine == 0) canvas.println();
+    }
+  }
+
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 240, 135);
+}
+#endif
 
 // ====== IMU + VQF config ======
 static const float GYR_HZ = 110.0f;   // gyro  rate
@@ -115,11 +181,16 @@ void setup() {
     delay(5);
   #endif
 
-  // #ifdef ARDUINO_ADAFRUIT_FEATHER_ESP32S2_TFT
-  //   pinMode(21, OUTPUT);
-  //   digitalWrite(21, HIGH); // Enable 3V3 rail
-  //   delay(5);
-  // #endif
+  #ifdef ARDUINO_ADAFRUIT_FEATHER_ESP32S2_TFT
+    pinMode(21, OUTPUT);
+    digitalWrite(21, HIGH); // Enable 3V3 rail, TFT_I2C_POWER may not be defined
+    delay(5);
+  #endif
+  #ifdef ARDUINO_ADAFRUIT_FEATHER_ESP32S2_TFT
+    pinMode(34, OUTPUT);
+    digitalWrite(34, HIGH); // Neopixel power
+    delay(5);
+  #endif
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
   Wire.setTimeout(1000);
@@ -171,6 +242,9 @@ void setup() {
   selectMultiplexerChannel(0);
   delay(50);
 
+  #if defined(ARDUINO_ADAFRUIT_FEATHER_ESP32S2_TFT)
+  tftShowI2CAddresses();   // draw the detected I2C addresses to the TFT
+  #endif
 
   // Try to initialize the BNO at the configured address, fall back to 0x28
   uint8_t triedAddrs[2] = { (uint8_t)BNO_ADDR, 0x28 };
@@ -213,6 +287,7 @@ void loop() {
   // selectMultiplexerChannel(0);
   
   sh2_SensorValue_t evt;
+  uint32_t guard_us = micros();
   while (bno08x.getSensorEvent(&evt)) {
     switch (evt.sensorId) {
       case SH2_GYROSCOPE_UNCALIBRATED:
@@ -244,4 +319,7 @@ void loop() {
     haveNewGyr = false;
     haveNewAcc = false;
   }
+  if ((micros() - guard_us) > 5000)break;
+  yield(); // allow background tasks
+
 }
