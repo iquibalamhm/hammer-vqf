@@ -21,6 +21,10 @@ extern "C" {
 #define ENABLE_FPA_TRACE 0
 #endif
 
+#ifndef ENABLE_FPA_TRACE_SERIAL
+#define ENABLE_FPA_TRACE_SERIAL 1
+#endif
+
 #if ENABLE_FPA_TRACE
 static void fpaTraceSample(uint32_t strideIdx,
                            float sampleTimeS,
@@ -34,6 +38,49 @@ static void fpaTraceSample(uint32_t strideIdx,
 
 // --- Foot Progression Angle ---
 #include "FPA.hpp"
+
+struct FpaKinematicSample {
+  uint32_t stride_idx;
+  float sample_time_s;
+  float dt_s;
+  float v_raw[3];
+  float v_df[3];
+  float pos[3];
+};
+
+#if ENABLE_FPA_TRACE
+static constexpr size_t kFpaSampleCapacity = static_cast<size_t>(FPA::MAX_SAMPLES);
+static FpaKinematicSample g_fpaSampleQueue[kFpaSampleCapacity];
+static size_t g_fpaSampleHead = 0;
+static size_t g_fpaSampleTail = 0;
+
+static inline bool fpaSampleQueueEmpty() {
+  return g_fpaSampleHead == g_fpaSampleTail;
+}
+
+static void fpaSampleEnqueue(const FpaKinematicSample& sample) {
+  size_t next = (g_fpaSampleHead + 1U) % kFpaSampleCapacity;
+  if (next == g_fpaSampleTail) {
+    g_fpaSampleTail = (g_fpaSampleTail + 1U) % kFpaSampleCapacity; // drop oldest on overflow
+  }
+  g_fpaSampleQueue[g_fpaSampleHead] = sample;
+  g_fpaSampleHead = next;
+}
+
+static bool fpaSampleDequeue(FpaKinematicSample* out) {
+  if (fpaSampleQueueEmpty()) {
+    return false;
+  }
+  if (out) {
+    *out = g_fpaSampleQueue[g_fpaSampleTail];
+  }
+  g_fpaSampleTail = (g_fpaSampleTail + 1U) % kFpaSampleCapacity;
+  return true;
+}
+#endif
+
+static FpaKinematicSample g_fpaSampleLatest = {};
+static bool g_fpaSampleLatestValid = false;
 
 #ifndef ENABLE_FPA_DEBUG
 #define ENABLE_FPA_DEBUG 1
@@ -88,6 +135,11 @@ static void fpaTraceSample(uint32_t strideIdx,
 #define DEBUG_PRINT(x) do {} while (0)
 #define DEBUG_PRINTF(...) do {} while (0)
 #endif
+
+// Accelerometer bias correction (measured when stationary in sensor frame)
+// Adjust these values based on your sensor's stationary readings
+static float g_acc_bias[3] = {-0.2f, 2.2f, 0.0f}; // [x, y, z] bias in m/s²
+
 static FPA g_fpa(/*is_left_foot=*/true); // set to false if this sensor is on the RIGHT foot
 static uint32_t g_lastFeedUs = 0;
 static float g_lastFeedDt = 0.0f;
@@ -116,6 +168,21 @@ static void fpaTraceSample(uint32_t strideIdx,
   if (!vRaw || !vDf || !posE) {
     return;
   }
+  FpaKinematicSample sample{};
+  sample.stride_idx = strideIdx;
+  sample.sample_time_s = sampleTimeS;
+  sample.dt_s = dtS;
+  sample.v_raw[0] = vRaw[0];
+  sample.v_raw[1] = vRaw[1];
+  sample.v_raw[2] = vRaw[2];
+  sample.v_df[0] = vDf[0];
+  sample.v_df[1] = vDf[1];
+  sample.v_df[2] = vDf[2];
+  sample.pos[0] = posE[0];
+  sample.pos[1] = posE[1];
+  sample.pos[2] = posE[2];
+  fpaSampleEnqueue(sample);
+#if ENABLE_FPA_TRACE_SERIAL
   Serial.printf(
     "TRACE,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
     static_cast<unsigned long>(strideIdx),
@@ -124,6 +191,7 @@ static void fpaTraceSample(uint32_t strideIdx,
     vRaw[0], vRaw[1], vRaw[2],
     vDf[0], vDf[1], vDf[2],
     posE[0], posE[1], posE[2]);
+#endif
 }
 #endif
 
@@ -608,6 +676,13 @@ static uint32_t streamStartUs = 0;
 
 static void printCsvSample(float t_ms) {
 #if ENABLE_CSV_STREAM
+#if ENABLE_FPA_TRACE
+  FpaKinematicSample dequeuedSample;
+  if (fpaSampleDequeue(&dequeuedSample)) {
+    g_fpaSampleLatest = dequeuedSample;
+    g_fpaSampleLatestValid = true;
+  }
+#endif
   Serial.print(t_ms, 3);      Serial.print(',');
   Serial.print(acc[0], 6);    Serial.print(',');
   Serial.print(acc[1], 6);    Serial.print(',');
@@ -646,6 +721,32 @@ static void printCsvSample(float t_ms) {
   } else {
     Serial.print("nan");
   }
+#if ENABLE_FPA_TRACE
+  Serial.print(",raw_vx=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.v_raw[0], 6); else Serial.print("nan");
+  Serial.print(",raw_vy=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.v_raw[1], 6); else Serial.print("nan");
+  Serial.print(",raw_vz=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.v_raw[2], 6); else Serial.print("nan");
+  Serial.print(",corr_vx=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.v_df[0], 6); else Serial.print("nan");
+  Serial.print(",corr_vy=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.v_df[1], 6); else Serial.print("nan");
+  Serial.print(",corr_vz=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.v_df[2], 6); else Serial.print("nan");
+  Serial.print(",pos_x=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.pos[0], 6); else Serial.print("nan");
+  Serial.print(",pos_y=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.pos[1], 6); else Serial.print("nan");
+  Serial.print(",pos_z=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.pos[2], 6); else Serial.print("nan");
+  Serial.print(",fpa_stride_idx=");
+  if (g_fpaSampleLatestValid) Serial.print(static_cast<unsigned long>(g_fpaSampleLatest.stride_idx)); else Serial.print("nan");
+  Serial.print(",fpa_stride_t_rel=");
+  if (g_fpaSampleLatestValid) Serial.print(g_fpaSampleLatest.sample_time_s, 6); else Serial.print("nan");
+#else
+  Serial.print(",raw_vx=nan,raw_vy=nan,raw_vz=nan,corr_vx=nan,corr_vy=nan,corr_vz=nan,pos_x=nan,pos_y=nan,pos_z=nan,fpa_stride_idx=nan,fpa_stride_t_rel=nan");
+#endif
 #else
   (void)t_ms;
 #endif
@@ -783,9 +884,10 @@ void loop() {
 
       case SH2_ACCELEROMETER:
         // m/s^2 including gravity
-        acc[0] = evt.un.accelerometer.x;
-        acc[1] = evt.un.accelerometer.y;
-        acc[2] = evt.un.accelerometer.z;
+        // Apply bias correction before feeding to VQF and FPA
+        acc[0] = evt.un.accelerometer.x - g_acc_bias[0];
+        acc[1] = evt.un.accelerometer.y - g_acc_bias[1];
+        acc[2] = evt.un.accelerometer.z - g_acc_bias[2];
         updateAcc(acc);
         haveNewAcc = true;
         haveAccSample = true;

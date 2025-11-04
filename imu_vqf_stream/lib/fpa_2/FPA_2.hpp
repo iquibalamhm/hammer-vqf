@@ -67,7 +67,7 @@ class FPA {
 public:
   // MAX_SAMPLES: capacity for buffered samples between consecutive rest instants.
   // For ~1 s stride at 200 Hz effective feeding -> 200; we pick 1024 to be safe.
-  static const int MAX_SAMPLES = 1024;
+  static const int MAX_SAMPLES = 512;
 
   // Construct with whether this is the LEFT foot (true) or RIGHT foot (false).
   // Sample period can be variable; pass dt per sample in feed().
@@ -409,7 +409,10 @@ void FPA::integrate_and_compute_() {
 
   // 1) integrate velocity from t_prev..t0 in E frame
   float v[3] = {0,0,0};
-  float gE[3] = {0,0,9.81f};
+  // Accelerometer measures proper acceleration (including gravity reaction force)
+  // When stationary in Earth frame, it reads [0, 0, +g] (upward normal force)
+  // To get linear acceleration, subtract this: a_linear = a_measured - [0, 0, +g]
+  float gE[3] = {0.0f, 0.0f, 9.81f};
   // We'll store raw v at each step to later correct drift linearly
   static float v_raw[ MAX_SAMPLES ][3];
   int i0 = idx_stride_begin_;
@@ -419,6 +422,7 @@ void FPA::integrate_and_compute_() {
   for (int i=i0; i<i1; ++i) {
     float aE[3];
     quat_rotate_vec(buf_qSE_[i], buf_acc_[i], aE);
+    // Remove gravity: a_linear = a_measured - g_E
     aE[0] -= gE[0]; aE[1] -= gE[1]; aE[2] -= gE[2];
     float dt = buf_dt_[i];
     v[0] += aE[0]*dt; v[1] += aE[1]*dt; v[2] += aE[2]*dt;

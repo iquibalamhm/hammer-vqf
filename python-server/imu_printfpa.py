@@ -149,10 +149,10 @@ class RPY3DWindow(QtWidgets.QMainWindow):
 
 
 class SensorPlotWindow(QtWidgets.QMainWindow):
-    def __init__(self, show_accel, show_gyro, show_mag, parent=None):
+    def __init__(self, show_accel, show_gyro, show_mag, show_velocity, show_position, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Sensor Streams")
-        self.resize(900, 720)
+        self.resize(960, 960)
 
         central = QtWidgets.QWidget(self)
         layout = QtWidgets.QVBoxLayout(central)
@@ -195,6 +195,26 @@ class SensorPlotWindow(QtWidgets.QMainWindow):
             self.curves["mx"] = plot.plot([], [], pen=pg.mkPen((255, 220, 120), width=2), name="mx")
             self.curves["my"] = plot.plot([], [], pen=pg.mkPen((160, 255, 200), width=2), name="my")
             self.curves["mz"] = plot.plot([], [], pen=pg.mkPen((200, 200, 255), width=2), name="mz")
+
+        if show_velocity:
+            plot_raw = make_plot("Velocity Raw (m/s)")
+            self.plots["vel_raw"] = plot_raw
+            self.curves["raw_vx"] = plot_raw.plot([], [], pen=pg.mkPen((255, 150, 150), width=2), name="raw_vx")
+            self.curves["raw_vy"] = plot_raw.plot([], [], pen=pg.mkPen((150, 255, 150), width=2), name="raw_vy")
+            self.curves["raw_vz"] = plot_raw.plot([], [], pen=pg.mkPen((150, 180, 255), width=2), name="raw_vz")
+
+            plot_corr = make_plot("Velocity Corrected (m/s)")
+            self.plots["vel_corr"] = plot_corr
+            self.curves["corr_vx"] = plot_corr.plot([], [], pen=pg.mkPen((255, 120, 120), width=2), name="corr_vx")
+            self.curves["corr_vy"] = plot_corr.plot([], [], pen=pg.mkPen((120, 255, 120), width=2), name="corr_vy")
+            self.curves["corr_vz"] = plot_corr.plot([], [], pen=pg.mkPen((120, 160, 255), width=2), name="corr_vz")
+
+        if show_position:
+            plot_pos = make_plot("Foot Position (m)")
+            self.plots["pos"] = plot_pos
+            self.curves["pos_x"] = plot_pos.plot([], [], pen=pg.mkPen((255, 200, 120), width=2), name="pos_x")
+            self.curves["pos_y"] = plot_pos.plot([], [], pen=pg.mkPen((120, 255, 200), width=2), name="pos_y")
+            self.curves["pos_z"] = plot_pos.plot([], [], pen=pg.mkPen((180, 200, 255), width=2), name="pos_z")
 
 
 def parse_args():
@@ -264,8 +284,12 @@ def parse_line(line):
         if not key:
             continue
         try:
-            if key == "stride":
-                extras[key] = int(float(raw_val))
+            if key in ("stride", "fpa_stride_idx"):
+                val = float(raw_val)
+                if math.isfinite(val):
+                    extras[key] = int(val)
+                else:
+                    extras[key] = None
             else:
                 extras[key] = float(raw_val)
         except ValueError:
@@ -380,17 +404,18 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.sensor_window = None
         self.sensor_plots = {}
         self.sensor_curves = {}
-        if any(p in self.plots_enabled for p in ("accel", "gyro", "mag")):
-            self.sensor_window = SensorPlotWindow(
-                show_accel="accel" in self.plots_enabled,
-                show_gyro="gyro" in self.plots_enabled,
-                show_mag="mag" in self.plots_enabled,
-                parent=self,
-            )
-            self.sensor_window.show()
-            self.sensor_plots = dict(self.sensor_window.plots)
-            self.sensor_curves = dict(self.sensor_window.curves)
-            self.sensor_window.destroyed.connect(self._on_sensor_window_destroyed)
+        self.sensor_window = SensorPlotWindow(
+            show_accel="accel" in self.plots_enabled,
+            show_gyro="gyro" in self.plots_enabled,
+            show_mag="mag" in self.plots_enabled,
+            show_velocity=True,
+            show_position=True,
+            parent=self,
+        )
+        self.sensor_window.show()
+        self.sensor_plots = dict(self.sensor_window.plots)
+        self.sensor_curves = dict(self.sensor_window.curves)
+        self.sensor_window.destroyed.connect(self._on_sensor_window_destroyed)
 
         # Data buffers (deques of (t, value))
         self.t0 = None
@@ -406,6 +431,11 @@ class IMUWindow(QtWidgets.QMainWindow):
             self.buf.update({"roll": deque(), "pitch": deque(), "yaw": deque()})
         if "fpa" in self.plots_enabled:
             self.buf["fpa"] = deque()
+        for key in ("raw_vx", "raw_vy", "raw_vz",
+                    "corr_vx", "corr_vy", "corr_vz",
+                    "pos_x", "pos_y", "pos_z"):
+            if key not in self.buf:
+                self.buf[key] = deque()
         self._samples_key = next(iter(self.buf), None)
 
         # Orientation (from serial footRoll/pitch/yaw)
@@ -423,6 +453,11 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.foot_roll = math.nan
         self.foot_pitch = math.nan
         self.foot_yaw = math.nan
+        self.live_raw_vel = [math.nan, math.nan, math.nan]
+        self.live_corr_vel = [math.nan, math.nan, math.nan]
+        self.live_pos = [math.nan, math.nan, math.nan]
+        self.live_stride_idx = None
+        self.live_stride_time = math.nan
 
         self.plot_acc = self.cur_ax = self.cur_ay = self.cur_az = None
         self.plot_gyr = self.cur_gx = self.cur_gy = self.cur_gz = None
@@ -902,6 +937,11 @@ class IMUWindow(QtWidgets.QMainWindow):
         self.plot_acc = self.cur_ax = self.cur_ay = self.cur_az = None
         self.plot_gyr = self.cur_gx = self.cur_gy = self.cur_gz = None
         self.plot_mag = self.cur_mx = self.cur_my = self.cur_mz = None
+        self.live_raw_vel = [math.nan, math.nan, math.nan]
+        self.live_corr_vel = [math.nan, math.nan, math.nan]
+        self.live_pos = [math.nan, math.nan, math.nan]
+        self.live_stride_idx = None
+        self.live_stride_time = math.nan
 
     def on_timer(self):
         # drain queue
@@ -994,6 +1034,32 @@ class IMUWindow(QtWidgets.QMainWindow):
                         yaw_extra if yaw_extra is not None else math.nan,
                     )
 
+                for idx, key in enumerate(("raw_vx", "raw_vy", "raw_vz")):
+                    val = extras.get(key)
+                    if val is not None and math.isfinite(val):
+                        self.append(key, trel, val)
+                        self.live_raw_vel[idx] = val
+                for idx, key in enumerate(("corr_vx", "corr_vy", "corr_vz")):
+                    val = extras.get(key)
+                    if val is not None and math.isfinite(val):
+                        self.append(key, trel, val)
+                        self.live_corr_vel[idx] = val
+                for idx, key in enumerate(("pos_x", "pos_y", "pos_z")):
+                    val = extras.get(key)
+                    if val is not None and math.isfinite(val):
+                        self.append(key, trel, val)
+                        self.live_pos[idx] = val
+
+                stride_idx_live = extras.get("fpa_stride_idx")
+                if stride_idx_live is not None:
+                    try:
+                        self.live_stride_idx = int(stride_idx_live)
+                    except (ValueError, TypeError):
+                        self.live_stride_idx = None
+                stride_time_live = extras.get("fpa_stride_t_rel")
+                if stride_time_live is not None and math.isfinite(stride_time_live):
+                    self.live_stride_time = stride_time_live
+
         self.pull_latest_foot_orientation()
         self.update_foot_axes()
         self.update_rpy3d_window()
@@ -1045,6 +1111,51 @@ class IMUWindow(QtWidgets.QMainWindow):
                 self.cur_mz.setData(tm, mzv)
                 self.plot_mag.setXRange(x0, x1, padding=0.0)
 
+            if "vel_raw" in self.sensor_plots:
+                tr_raw, vrx = self.series("raw_vx"); _, vry = self.series("raw_vy"); _, vrz = self.series("raw_vz")
+                curve = self.sensor_curves.get("raw_vx")
+                if curve is not None:
+                    curve.setData(tr_raw, vrx)
+                curve = self.sensor_curves.get("raw_vy")
+                if curve is not None:
+                    curve.setData(tr_raw, vry)
+                curve = self.sensor_curves.get("raw_vz")
+                if curve is not None:
+                    curve.setData(tr_raw, vrz)
+                plot = self.sensor_plots.get("vel_raw")
+                if plot is not None:
+                    plot.setXRange(x0, x1, padding=0.0)
+
+            if "vel_corr" in self.sensor_plots:
+                tr_corr, vcx = self.series("corr_vx"); _, vcy = self.series("corr_vy"); _, vcz = self.series("corr_vz")
+                curve = self.sensor_curves.get("corr_vx")
+                if curve is not None:
+                    curve.setData(tr_corr, vcx)
+                curve = self.sensor_curves.get("corr_vy")
+                if curve is not None:
+                    curve.setData(tr_corr, vcy)
+                curve = self.sensor_curves.get("corr_vz")
+                if curve is not None:
+                    curve.setData(tr_corr, vcz)
+                plot = self.sensor_plots.get("vel_corr")
+                if plot is not None:
+                    plot.setXRange(x0, x1, padding=0.0)
+
+            if "pos" in self.sensor_plots:
+                tp, px = self.series("pos_x"); _, py = self.series("pos_y"); _, pz = self.series("pos_z")
+                curve = self.sensor_curves.get("pos_x")
+                if curve is not None:
+                    curve.setData(tp, px)
+                curve = self.sensor_curves.get("pos_y")
+                if curve is not None:
+                    curve.setData(tp, py)
+                curve = self.sensor_curves.get("pos_z")
+                if curve is not None:
+                    curve.setData(tp, pz)
+                plot = self.sensor_plots.get("pos")
+                if plot is not None:
+                    plot.setXRange(x0, x1, padding=0.0)
+
             # rpy
             if self.use_vqf and self.plot_rpy is not None:
                 tr, rv = self.series("roll"); _, pv = self.series("pitch"); _, yv = self.series("yaw")
@@ -1076,6 +1187,10 @@ class IMUWindow(QtWidgets.QMainWindow):
                     status.append(f"Ts={self.fpa_stride_time:.2f}s")
             if math.isfinite(self.foot_roll) and math.isfinite(self.foot_pitch) and math.isfinite(self.foot_yaw):
                 status.append(f"Foot r/p/y={self.foot_roll:.1f}/{self.foot_pitch:.1f}/{self.foot_yaw:.1f}°")
+            if all(math.isfinite(v) for v in self.live_pos):
+                status.append(f"posE={self.live_pos[0]:.3f}/{self.live_pos[1]:.3f}/{self.live_pos[2]:.3f}m")
+            if all(math.isfinite(v) for v in self.live_corr_vel):
+                status.append(f"vel={self.live_corr_vel[0]:.3f}/{self.live_corr_vel[1]:.3f}/{self.live_corr_vel[2]:.3f}m/s")
             self.status.showMessage("  |  ".join(status))
 
 
