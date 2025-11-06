@@ -18,6 +18,7 @@ except Exception:
 
 from .fpa_events import FootFlatDetector
 from .reader import ReaderThread
+from .hrfc import HRFCDetector
 
 
 class RPY3DWindow(QtWidgets.QMainWindow):
@@ -102,7 +103,20 @@ class IMUWindow(QtWidgets.QMainWindow):
 			"ax": deque(), "ay": deque(), "az": deque(),
 			"gx": deque(), "gy": deque(), "gz": deque(),
 			"roll": deque(), "pitch": deque(), "yaw": deque(),
+			"qw": deque(), "qx": deque(), "qy": deque(), "qz": deque(),
 		}
+		
+		# HR/FC detection buffers
+		self.hrfc_buf = {
+			"t": deque(),
+			"a_err": deque(),
+			"a_th": deque(),
+			"w_norm": deque(),
+			"w_th": deque(),
+			"r": deque(),
+		}
+		self.hr_points = []  # [(t, y), ...]
+		self.fc_points = []  # [(t, y), ...]
 
 		# Foot-flat detector (expects gyro in rad/s)
 		self.det = FootFlatDetector(
@@ -117,6 +131,21 @@ class IMUWindow(QtWidgets.QMainWindow):
 			w_acc=self.args.w_acc,
 			w_gyr=self.args.w_gyr,
 		)
+		
+		# HR/FC detector
+		self.hrfc_det = HRFCDetector(
+			g=self.args.g,
+			th_win=self.args.th_win,
+			rc_iters=self.args.rc_iters,
+			hyst_frac=self.args.hyst_frac,
+			a_th_min=self.args.a_th_min,
+			w_th_min=self.args.w_th_min,
+			w_acc=self.args.w_acc,
+			w_gyr=self.args.w_gyr,
+			T0_min=self.args.t0_min,
+			T1_min=self.args.t1_min,
+			gyro_units=self.args.gyro_units
+		)
 
 		# Gyro unit conversion for detector (rad/s)
 		self._to_rad = (math.pi/180.0) if self.args.gyro_units == "deg" else 1.0
@@ -125,6 +154,10 @@ class IMUWindow(QtWidgets.QMainWindow):
 		self._fc_lines = []
 		self._hr_lines = []
 		self._rest_lines = []
+		
+		# Debug counters
+		self.sample_count = 0
+		self.debug_interval = 100  # Print debug info every 100 samples
 
 		# Orientation is now provided directly as quaternions from the device
 		self.use_quat = True  # Always true since device sends quaternions
@@ -160,6 +193,9 @@ class IMUWindow(QtWidgets.QMainWindow):
 		self.cur_ax = self.plot_acc.plot([], [], pen=pg.mkPen((255,120,120), width=2), name="ax")
 		self.cur_ay = self.plot_acc.plot([], [], pen=pg.mkPen((120,255,120), width=2), name="ay")
 		self.cur_az = self.plot_acc.plot([], [], pen=pg.mkPen((120,170,255), width=2), name="az")
+		# HR/FC overlays: |a|-g and threshold
+		self.cur_a_err = self.plot_acc.plot([], [], pen=pg.mkPen((255,255,100), width=2), name="|a|-g")
+		self.cur_a_th = self.plot_acc.plot([], [], pen=pg.mkPen((255,150,0), width=2, style=QtCore.Qt.DashLine), name="a_th")
 
 		self.glw.nextRow()
 		self.plot_gyr = self.glw.addPlot(title="Gyroscope (deg/s)")
@@ -168,6 +204,20 @@ class IMUWindow(QtWidgets.QMainWindow):
 		self.cur_gx = self.plot_gyr.plot([], [], pen=pg.mkPen((255,180,120), width=2), name="gx")
 		self.cur_gy = self.plot_gyr.plot([], [], pen=pg.mkPen((180,255,120), width=2), name="gy")
 		self.cur_gz = self.plot_gyr.plot([], [], pen=pg.mkPen((180,200,255), width=2), name="gz")
+		# HR/FC overlays: ‖ω‖ and threshold
+		self.cur_w_norm = self.plot_gyr.plot([], [], pen=pg.mkPen((255,255,100), width=2), name="‖ω‖")
+		self.cur_w_th = self.plot_gyr.plot([], [], pen=pg.mkPen((255,150,0), width=2, style=QtCore.Qt.DashLine), name="w_th")
+
+		# Quaternion plot (raw quaternion components from device)
+		self.glw.nextRow()
+		self.plot_quat = self.glw.addPlot(title="Quaternion (from device)")
+		self.plot_quat.addLegend()
+		self.plot_quat.showGrid(x=True, y=True, alpha=0.3)
+		self.plot_quat.setYRange(-1.1, 1.1, padding=0.05)
+		self.cur_qw = self.plot_quat.plot([], [], pen=pg.mkPen((255,100,255), width=2), name="qw")
+		self.cur_qx = self.plot_quat.plot([], [], pen=pg.mkPen((255,120,120), width=2), name="qx")
+		self.cur_qy = self.plot_quat.plot([], [], pen=pg.mkPen((120,255,120), width=2), name="qy")
+		self.cur_qz = self.plot_quat.plot([], [], pen=pg.mkPen((120,170,255), width=2), name="qz")
 
 		# Orientation plot (quaternions from device converted to Euler)
 		self.glw.nextRow()
@@ -178,6 +228,24 @@ class IMUWindow(QtWidgets.QMainWindow):
 		self.cur_roll  = self.plot_rpy.plot([], [], pen=pg.mkPen((255,80,80), width=3), name="roll")
 		self.cur_pitch = self.plot_rpy.plot([], [], pen=pg.mkPen((80,255,80), width=3), name="pitch")
 		self.cur_yaw   = self.plot_rpy.plot([], [], pen=pg.mkPen((80,80,255), width=3), name="yaw")
+		
+		# Event strip: rest signal + HR/FC markers
+		self.glw.nextRow()
+		self.plot_events = self.glw.addPlot(title="Gait Events (0=move/HR, 1=rest/FC)")
+		self.plot_events.addLegend()
+		self.plot_events.showGrid(x=True, y=True, alpha=0.3)
+		self.plot_events.setYRange(-0.2, 1.2, padding=0.0)
+		self.cur_rest = self.plot_events.plot([], [], pen=pg.mkPen((150,150,150), width=3), 
+		                                      name="rest r(t)", connect='finite')
+		self.hr_scatter = pg.ScatterPlotItem(size=12, pen=pg.mkPen((220,0,0), width=2), 
+		                                     brush=pg.mkBrush((220,0,0,150)), 
+		                                     symbol='t1', name="HR")
+		self.fc_scatter = pg.ScatterPlotItem(size=12, pen=pg.mkPen((0,200,0), width=2), 
+		                                     brush=pg.mkBrush((0,200,0,150)), 
+		                                     symbol='t', name="FC")
+		self.plot_events.addItem(self.hr_scatter)
+		self.plot_events.addItem(self.fc_scatter)
+		self.plot_events.addLegend()
 
 		# Reader thread + timer to drain queue
 		self.q = queue.Queue(maxsize=args.queue_max)
@@ -243,7 +311,7 @@ class IMUWindow(QtWidgets.QMainWindow):
 			pen = pg.mkPen((50,120,255), width=2, style=QtCore.Qt.DashLine)
 			line = pg.InfiniteLine(pos=t_rel, angle=90, movable=False, pen=pen)
 			self._rest_lines.append(line)
-		for p in (self.plot_acc, self.plot_gyr, self.plot_rpy):
+		for p in (self.plot_acc, self.plot_gyr, self.plot_quat, self.plot_rpy, self.plot_events):
 			p.addItem(line)
 
 	def _prune_old_markers(self, x_min):
@@ -254,7 +322,7 @@ class IMUWindow(QtWidgets.QMainWindow):
 				if t >= x_min:
 					kept.append(ln)
 				else:
-					for p in (self.plot_acc, self.plot_gyr, self.plot_rpy):
+					for p in (self.plot_acc, self.plot_gyr, self.plot_quat, self.plot_rpy, self.plot_events):
 						try:
 							p.removeItem(ln)
 						except Exception:
@@ -316,6 +384,56 @@ class IMUWindow(QtWidgets.QMainWindow):
 				t_evt_rel = (t_evt_ms * 1e-3) - self.t0
 				self._add_event_marker(t_evt_rel, tag)
 				print(f"EVT,{t_evt_ms:.3f},{tag}")
+			
+			# HR/FC detector update
+			self.hrfc_det.update(t_ms, ax, ay, az, gx, gy, gz, qw, qx, qy, qz)
+			dbg = self.hrfc_det.get_debug()
+			
+			# Sample counter and periodic debug
+			self.sample_count += 1
+			if self.sample_count % self.debug_interval == 0:
+				print(f"[DEBUG] Sample {self.sample_count}: t={t_ms:.0f}ms, "
+				      f"a_err={dbg['a_err']:.3f}, a_th={dbg['a_th']:.3f}, "
+				      f"w_norm={dbg['w_norm']:.4f}, w_th={dbg['w_th']:.4f}, "
+				      f"rest={dbg['r']}")
+				sys.stdout.flush()
+			
+			# Store HR/FC debug data
+			self.hrfc_buf["t"].append(trel)
+			self.hrfc_buf["a_err"].append(dbg['a_err'])
+			self.hrfc_buf["a_th"].append(dbg['a_th'])
+			self.hrfc_buf["w_norm"].append(dbg['w_norm'])
+			self.hrfc_buf["w_th"].append(dbg['w_th'])
+			self.hrfc_buf["r"].append(dbg['r'])
+			
+			# Trim HR/FC buffers
+			t_cut = trel - self.win
+			for key in self.hrfc_buf:
+				buf = self.hrfc_buf[key]
+				while buf and (self.hrfc_buf["t"][0] if key == "t" else True) and \
+				      len(self.hrfc_buf["t"]) > 0 and self.hrfc_buf["t"][0] < t_cut:
+					for k in self.hrfc_buf:
+						if self.hrfc_buf[k]:
+							self.hrfc_buf[k].popleft()
+					break
+			
+			# Pop HR/FC events
+			for tag, te in self.hrfc_det.pop_events():
+				t_evt_rel = te - self.t0
+				if tag == "HR":
+					self.hr_points.append((t_evt_rel, 0.0))
+					print(f"EVT,{te:.3f},{tag} (HR - Heel Rise)")
+					sys.stdout.flush()
+				else:  # FC
+					self.fc_points.append((t_evt_rel, 1.0))
+					print(f"EVT,{te:.3f},{tag} (FC - Full Contact)")
+					sys.stdout.flush()
+
+			# Store quaternion components
+			self.append("qw", trel, qw)
+			self.append("qx", trel, qx)
+			self.append("qy", trel, qy)
+			self.append("qz", trel, qz)
 
 			if not (math.isnan(qw) or math.isnan(qx) or math.isnan(qy) or math.isnan(qz)):
 				roll, pitch, yaw = [math.degrees(v) for v in self.quat_to_euler_zyx(qw, qx, qy, qz)]
@@ -341,6 +459,14 @@ class IMUWindow(QtWidgets.QMainWindow):
 			self.cur_ax.setData(tx, axv)
 			self.cur_ay.setData(tx, ayv)
 			self.cur_az.setData(tx, azv)
+			
+			# HR/FC accel overlays
+			t_hrfc = list(self.hrfc_buf["t"])
+			a_err_v = list(self.hrfc_buf["a_err"])
+			a_th_v = list(self.hrfc_buf["a_th"])
+			self.cur_a_err.setData(t_hrfc, a_err_v)
+			self.cur_a_th.setData(t_hrfc, a_th_v)
+			
 			self.plot_acc.setXRange(x0, x1, padding=0.0)
 
 			tg, gxv = self.series("gx")
@@ -349,7 +475,27 @@ class IMUWindow(QtWidgets.QMainWindow):
 			self.cur_gx.setData(tg, gxv)
 			self.cur_gy.setData(tg, gyv)
 			self.cur_gz.setData(tg, gzv)
+			
+			# HR/FC gyro overlays (convert to deg/s for display if needed)
+			w_norm_v = list(self.hrfc_buf["w_norm"])
+			w_th_v = list(self.hrfc_buf["w_th"])
+			if self.args.gyro_units == "rad":
+				w_norm_v = [math.degrees(w) for w in w_norm_v]
+				w_th_v = [math.degrees(w) for w in w_th_v]
+			self.cur_w_norm.setData(t_hrfc, w_norm_v)
+			self.cur_w_th.setData(t_hrfc, w_th_v)
+			
 			self.plot_gyr.setXRange(x0, x1, padding=0.0)
+
+			tq, qwv = self.series("qw")
+			_, qxv = self.series("qx")
+			_, qyv = self.series("qy")
+			_, qzv = self.series("qz")
+			self.cur_qw.setData(tq, qwv)
+			self.cur_qx.setData(tq, qxv)
+			self.cur_qy.setData(tq, qyv)
+			self.cur_qz.setData(tq, qzv)
+			self.plot_quat.setXRange(x0, x1, padding=0.0)
 
 			tr, rv = self.series("roll")
 			tp, pv = self.series("pitch")
@@ -367,6 +513,31 @@ class IMUWindow(QtWidgets.QMainWindow):
 					self.cur_yaw.setData(tr_valid, yv_valid)
 
 			self.plot_rpy.setXRange(x0, x1, padding=0.0)
+			
+			# Event strip: rest signal + HR/FC markers
+			r_v = list(self.hrfc_buf["r"])
+			self.cur_rest.setData(t_hrfc, r_v)
+			self.plot_events.setXRange(x0, x1, padding=0.0)
+			
+			# Filter and update HR/FC scatter points
+			hr_filtered = [(t, y) for (t, y) in self.hr_points if t >= x0]
+			fc_filtered = [(t, y) for (t, y) in self.fc_points if t >= x0]
+			
+			# Trim old points
+			self.hr_points = hr_filtered
+			self.fc_points = fc_filtered
+			
+			if hr_filtered:
+				hrx, hry = zip(*hr_filtered)
+				self.hr_scatter.setData(hrx, hry)
+			else:
+				self.hr_scatter.setData([], [])
+			
+			if fc_filtered:
+				fcx, fcy = zip(*fc_filtered)
+				self.fc_scatter.setData(fcx, fcy)
+			else:
+				self.fc_scatter.setData([], [])
 
 			self._prune_old_markers(x0)
 
